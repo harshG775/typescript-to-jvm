@@ -1,3 +1,5 @@
+import type { ForeignMethod } from './type-registry.ts';
+
 export type ValueType =
   | { kind: 'f64' }
   | { kind: 'boolean' }
@@ -62,5 +64,6 @@ export type HirExpr =
   | { k: 'assign'; slot: number; type: ValueType; rhs: HirExpr }
   | { k: 'binary'; op: HirBinaryOp; left: HirExpr; right: HirExpr; resultType: ValueType }
   | { k: 'unary'; op: '-' | '!'; operand: HirExpr; resultType: ValueType }
-  | { k: 'call'; calleeName: string; args: HirExpr[]; resultType: ValueType }
+  /** `foreign` is set for registry calls (Math.abs, Log.d): the resolved overload and its JVM owner. */
+  | { k: 'call'; calleeName: string; args: HirExpr[]; resultType: ValueType; foreign?: { owner: string; method: ForeignMethod } }
   | { k: 'cond'; cond: HirExpr; then: HirExpr; else_: HirExpr; resultType: ValueType };

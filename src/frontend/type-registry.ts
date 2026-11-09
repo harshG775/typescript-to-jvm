@@ -5,6 +5,8 @@ export interface ForeignMethod {
   params: ValueType[];
   returnType: ValueType;
   isStatic: boolean;
+  /** Real JVM descriptor when it can't be derived from the TS-facing types (e.g. Log.d returns int). */
+  jvmDescriptor?: string;
 }
 
 export interface ForeignClassInfo {
@@ -17,9 +19,18 @@ const F64: ValueType = { kind: 'f64' };
 const STRING: ValueType = { kind: 'string' };
 const BOOLEAN: ValueType = { kind: 'boolean' };
 
-function staticMethod(name: string, params: ValueType[], returnType: ValueType): ForeignMethod {
-  return { name, params, returnType, isStatic: true };
+function staticMethod(
+  name: string,
+  params: ValueType[],
+  returnType: ValueType,
+  jvmDescriptor?: string,
+): ForeignMethod {
+  return jvmDescriptor === undefined
+    ? { name, params, returnType, isStatic: true }
+    : { name, params, returnType, isStatic: true, jvmDescriptor };
 }
+
+const LOG_DESC = '(Ljava/lang/String;Ljava/lang/String;)I';
 
 /** Hand-written foreign-class table, consulted at call sites by identifier text (not by TS type). */
 export function createDefaultRegistry(): Map<string, ForeignClassInfo> {
@@ -45,10 +56,10 @@ export function createDefaultRegistry(): Map<string, ForeignClassInfo> {
     tsName: 'Log',
     jvmInternalName: 'android/util/Log',
     methods: [
-      staticMethod('d', [STRING, STRING], BOOLEAN),
-      staticMethod('e', [STRING, STRING], BOOLEAN),
-      staticMethod('i', [STRING, STRING], BOOLEAN),
-      staticMethod('w', [STRING, STRING], BOOLEAN),
+      staticMethod('d', [STRING, STRING], BOOLEAN, LOG_DESC),
+      staticMethod('e', [STRING, STRING], BOOLEAN, LOG_DESC),
+      staticMethod('i', [STRING, STRING], BOOLEAN, LOG_DESC),
+      staticMethod('w', [STRING, STRING], BOOLEAN, LOG_DESC),
     ],
   });
 

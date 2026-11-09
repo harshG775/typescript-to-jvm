@@ -91,10 +91,16 @@ describe('HIR front end', () => {
 
   it('5. lowers a foreign call', () => {
     const fn = only('function f(x:number):number{return Math.abs(x);}');
-    expect(stmts(fn)).toEqual([
+    expect(stmts(fn)).toMatchObject([
       {
         k: 'return',
-        expr: { k: 'call', calleeName: 'Math.abs', args: [{ k: 'local', slot: 0, type: F64 }], resultType: F64 },
+        expr: {
+          k: 'call',
+          calleeName: 'Math.abs',
+          args: [{ k: 'local', slot: 0, type: F64 }],
+          resultType: F64,
+          foreign: { owner: 'java/lang/Math', method: { name: 'abs' } },
+        },
       },
     ]);
   });
@@ -157,7 +163,7 @@ describe('HIR front end', () => {
     const file = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'hello.ts');
     const { functions } = compileFileToHir(file, createDefaultRegistry());
     expect(functions).toHaveLength(1);
-    expect(stmts(functions[0]!)).toEqual([
+    expect(stmts(functions[0]!)).toMatchObject([
       {
         k: 'expr',
         expr: {
@@ -205,6 +211,10 @@ describe('HIR front end: extra checks', () => {
     expect(() => compile('function f():void{ for (;;) {} }')).toThrow(/test\.ts:1:/);
     expect(() => compile('function f(x:number):number{ return x ** 2; }')).toThrow(/unsupported operator/);
     expect(() => compile('function f(x:number):void{ x += 1; }')).toThrow(/unsupported operator/);
+  });
+
+  it('only allows throwing strings or caught errors', () => {
+    expect(() => compile('function f():void{ throw 1; }')).toThrow(/can only throw/);
   });
 
   it('reports syntax errors as FrontendError', () => {

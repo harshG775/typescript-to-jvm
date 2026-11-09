@@ -19,6 +19,9 @@ Pipeline: TS source → parse/typecheck (`typescript` package) → HIR → LIR �
 vp install
 pnpm typecheck
 vp test
+node scripts/compile.ts file.ts outDir [ClassName]   # writes outDir/ClassName.class
+node scripts/show.ts file.ts [hir|lir]               # dump an IR as JSON
+javap -c -cp outDir ClassName                        # disassemble the result
 ```
 
 ## Progress
@@ -48,21 +51,20 @@ vp test
 - [x] `vp test` passes (30 tests)
 - [x] Update the test script for vite-plus
 
-### Phase 3: HIR to LIR to bytecode
-
-- [ ] Not started
-
 ### Phase 3: HIR to LIR
 
-- [ ] Define the LIR
-- [ ] Lowering pass
-- [ ] Tests
+- [x] Define the LIR (`src/middle/lir.ts`): JVM-typed tree, descriptors as types, structured control flow
+- [x] Lowering pass (`src/middle/lower-hir-to-lir.ts`): boxing to `Object`, string concat chains, `String.equals`, throwable wrapping, call descriptors
+- [x] Tests (`test/middle/lir.test.ts`)
+- [x] HIR `call` carries the resolved foreign overload; `ForeignMethod.jvmDescriptor` for `Log` (real return is `int`)
+- [x] `throw` accepts only strings (wrapped in `RuntimeException`) or a caught error (rethrown)
 
 ### Phase 4: Codegen and first end-to-end run
 
-- [ ] LIR to `CodeBuilder`
-- [ ] `add.ts` compiles and runs on the JVM
-- [ ] String concat, foreign calls, try/catch/finally
+- [x] LIR to `CodeBuilder` (`src/backend/codegen.ts`)
+- [x] Compiled output runs on the JVM (`test/backend/e2e.test.ts`, `scripts/compile.ts`)
+- [x] String concat, foreign calls, try/catch/finally (finally inlined on normal exit and `return`; catch-all rethrows)
+- [x] Number to string matches JS for whole numbers (`2`, not `2.0`); 1e21 and 1e-7 still differ
 
 ### Phase 5: Android integration
 

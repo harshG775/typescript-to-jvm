@@ -80,6 +80,11 @@ export class CodeBuilder {
     this.maxLocals = this.nextLocal;
   }
 
+  /** False right after a return/throw/goto, until a jumped-to label is placed. */
+  get isReachable(): boolean {
+    return this.reachable;
+  }
+
   /** Current offset into the method's code. */
   get pc(): number {
     return this.out.length;

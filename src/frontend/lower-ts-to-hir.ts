@@ -189,7 +189,7 @@ class Lowerer {
     const params: HirParam[] = node.parameters.map((p, i) => {
       const pname = (p.name as ts.Identifier).text;
       const type = sig.params[i]!;
-      return { name: pname, type, slot: this.declare(pname, type, p.name) };
+      return { name: pname, type, slot: this.declareSlot(pname, type, p.name) };
     });
 
     const body = this.lowerStmt(node.body!);
@@ -220,7 +220,7 @@ class Lowerer {
   }
 
   /** Allocates the next slot(s), no reuse. Does not record the variable in `locals`. */
-  private declare(name: string, type: ValueType, node: ts.Node): number {
+  private declareSlot(name: string, type: ValueType, node: ts.Node): number {
     const scope = this.fn.scopes[this.fn.scopes.length - 1]!;
     if (scope.has(name)) errorAtNode(node, `duplicate declaration of '${name}'`);
     const slot = this.fn.nextSlot;
@@ -230,7 +230,7 @@ class Lowerer {
   }
 
   private declareLocal(name: string, type: ValueType, node: ts.Node): number {
-    const slot = this.declare(name, type, node);
+    const slot = this.declareSlot(name, type, node);
     this.fn.locals.push({ name, type, slot });
     return slot;
   }
@@ -266,7 +266,11 @@ class Lowerer {
     if (ts.isReturnStatement(node)) return this.lowerReturn(node);
     if (ts.isThrowStatement(node)) {
       const expr = this.lowerExpr(node.expression);
-      if (typeOf(expr).kind === 'void') errorAtNode(node.expression, 'cannot throw a void value');
+      const tk = typeOf(expr).kind;
+      // JVM `athrow` needs a Throwable: strings are wrapped in an exception, objects are a caught error rethrown.
+      if (tk !== 'string' && tk !== 'object') {
+        errorAtNode(node.expression, 'can only throw a string or a caught error in v1');
+      }
       return { k: 'throw', expr };
     }
     if (ts.isTryStatement(node)) return this.lowerTry(node);
@@ -491,7 +495,13 @@ class Lowerer {
           candidates.map((m) => `(${m.params.map(describe).join(', ')})`).join(' or '),
       );
     }
-    return { k: 'call', calleeName: qualified, args, resultType: match.returnType };
+    return {
+      k: 'call',
+      calleeName: qualified,
+      args,
+      resultType: match.returnType,
+      foreign: { owner: cls.jvmInternalName, method: match },
+    };
   }
 }
 
