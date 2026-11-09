@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vite-plus/test';
 import { compileFileToHir, compileSourceToHir } from '../../src/frontend/compile-file.ts';
 import { FrontendError } from '../../src/frontend/errors.ts';
 import type { HirFunction, HirProgram, HirStmt } from '../../src/frontend/hir.ts';
-import { createDefaultRegistry } from '../../src/frontend/type-registry.ts';
+import { builtinResolver } from '../../src/frontend/builtin-classes.ts';
 
 const F64 = { kind: 'f64' };
 const STRING = { kind: 'string' };
@@ -12,7 +12,7 @@ const BOOLEAN = { kind: 'boolean' };
 const OBJECT = { kind: 'object', className: 'java/lang/Object' };
 
 function compile(source: string): HirProgram {
-    return compileSourceToHir(source, { registry: createDefaultRegistry(), fileName: 'test.ts' });
+    return compileSourceToHir(source, { classes: builtinResolver(), fileName: 'test.ts' });
 }
 
 function only(source: string): HirFunction {
@@ -161,7 +161,7 @@ describe('HIR front end', () => {
 
     it('14. compiles a fixture from disk', () => {
         const file = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'hello.ts');
-        const { functions } = compileFileToHir(file, createDefaultRegistry());
+        const { functions } = compileFileToHir(file, builtinResolver());
         expect(functions).toHaveLength(1);
         expect(stmts(functions[0]!)).toMatchObject([
             {
@@ -173,7 +173,7 @@ describe('HIR front end', () => {
                         { k: 'str', value: 'ts2jvm' },
                         { k: 'str', value: 'hi' },
                     ],
-                    resultType: BOOLEAN,
+                    resultType: F64,
                 },
             },
         ]);
@@ -286,7 +286,7 @@ describe('HIR front end: classes', () => {
     });
 
     it('rejects unsupported class features with a source position', () => {
-        expect(() => compile('class A extends B {}')).toThrow(/inheritance/);
+        expect(() => compile('class A extends B {}')).toThrow(/unknown class 'B'/);
         expect(() => compile('class A { private x: number = 0; }')).toThrow(/modifier/);
         expect(() => compile('class A { static x: number = 0; }')).toThrow(/modifier/);
         expect(() => compile('class A { constructor(public x: number) {} }')).toThrow(/parameter properties/);
@@ -307,5 +307,96 @@ describe('HIR front end: classes', () => {
         expect(() => compile(`${A} function f(a: A): void { a.x = "s"; }`)).toThrow(/cannot assign string to f64/);
         expect(() => compile('function f(x: number): number { return x.y; }')).toThrow(/no fields or methods/);
         expect(() => compile('function f(): void { this.x = 1; }')).toThrow(/'this'/);
+    });
+});
+
+describe('HIR front end: inheritance and Android classes', () => {
+    const IMPORTS = `import { Activity } from 'android.app';
+        import { Bundle } from 'android.os';
+        import { TextView } from 'android.widget';`;
+    const ACTIVITY = `${IMPORTS}
+        class Screen extends Activity {
+            onCreate(b: Bundle | null): void {
+                super.onCreate(b);
+                const tv = new TextView(this);
+                tv.setText("hi");
+                tv.setTextSize(20);
+                this.setContentView(tv);
+            }
+        }`;
+
+    it('lowers a class that extends an imported class, with super calls and foreign instance calls', () => {
+        const [cls] = compile(ACTIVITY).classes;
+        expect(cls!.name).toBe('Screen');
+        expect(cls!.superName).toBe('android/app/Activity');
+        expect(cls!.superCall).toEqual({ descriptor: '()V', args: [] });
+
+        const body = stmts(cls!.methods[0]!);
+        expect(body).toMatchObject([
+            {
+                k: 'expr',
+                expr: {
+                    k: 'call-method',
+                    special: true,
+                    owner: 'android/app/Activity',
+                    name: 'onCreate',
+                    descriptor: '(Landroid/os/Bundle;)V',
+                },
+            },
+            {
+                k: 'var-decl',
+                type: { kind: 'object', className: 'android/widget/TextView' },
+                init: { k: 'new', className: 'android/widget/TextView', descriptor: '(Landroid/content/Context;)V' },
+            },
+            { k: 'expr', expr: { k: 'call-method', owner: 'android/widget/TextView', name: 'setText' } },
+            { k: 'expr', expr: { k: 'call-method', name: 'setTextSize', descriptor: '(F)V' } },
+            { k: 'expr', expr: { k: 'call-method', owner: 'Screen', name: 'setContentView' } },
+        ]);
+    });
+
+    it('picks overloads: a number prefers double over int, and narrows to int/float when it has to', () => {
+        const fn = compile('function f(): number { return Math.abs(-3); }').functions[0]!;
+        expect(stmts(fn)).toMatchObject([
+            { k: 'return', expr: { k: 'call', foreign: { method: { descriptor: '(D)D' } } } },
+        ]);
+    });
+
+    it('prefixes user classes with the package', () => {
+        const { classes } = compileSourceToHir('class A { b: B | null = null; } class B {}', {
+            classes: builtinResolver(),
+            fileName: 'test.ts',
+            classPrefix: 'com/example/',
+        });
+        expect(classes.map((c) => c.name)).toEqual(['com/example/A', 'com/example/B']);
+        expect(classes[0]!.fields).toEqual([{ name: 'b', type: { kind: 'object', className: 'com/example/B' } }]);
+    });
+
+    it('supports extends between user classes, explicit super(...) and subtype assignability', () => {
+        const src = `class Base { n: number; constructor(n: number) { this.n = n; } }
+            class Derived extends Base { constructor() { super(5); } }
+            function take(b: Base): number { return b.n; }
+            function f(): number { return take(new Derived()); }`;
+        const { classes } = compile(src);
+        expect(classes[1]!.superName).toBe('Base');
+        expect(classes[1]!.superCall).toMatchObject({ descriptor: '(D)V', args: [{ k: 'num', value: 5 }] });
+        expect(() => compile(`${src} function g(d: Derived): void {} function h(b: Base): void { g(b); }`)).toThrow(
+            /cannot pass Base as Derived/,
+        );
+    });
+
+    it('rejects bad imports, bad super calls and overrides that would not override', () => {
+        expect(() => compile("import { Nope } from 'android.app';")).toThrow(/class 'android.app.Nope' not found/);
+        expect(() => compile("import { X } from './x';")).toThrow(/not a Java package/);
+        expect(() => compile("import * as a from 'android.app';")).toThrow(/only named imports/);
+        expect(() => compile('class A extends A {}')).toThrow(/circular/);
+        expect(() => compile('class B { constructor(n: number) {} } class D extends B {}')).toThrow(
+            /no constructor without arguments/,
+        );
+        expect(() => compile('function f(): void { super.x(); }')).toThrow(/'super' is only available/);
+        expect(() =>
+            compile(
+                `${IMPORTS} class S extends Activity { onKeyDown(code: number, e: any): boolean { return true; } }`,
+            ),
+        ).toThrow(/doesn't match the JVM signature/);
     });
 });

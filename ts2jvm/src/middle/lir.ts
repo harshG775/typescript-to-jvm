@@ -25,6 +25,8 @@ export interface LirProgram {
 
 export interface LirClass {
     name: string;
+    /** JVM internal name of the superclass. */
+    superName: string;
     fields: { name: string; desc: Desc }[];
     /** Name `<init>`. Slot 0 is `this`; the body already starts with the super constructor call. */
     ctor: LirFunction;
@@ -79,6 +81,8 @@ export type LirExpr =
     | { k: 'store'; slot: number; desc: Desc; value: LirExpr }
     | { k: 'dbin'; op: DoubleOp; left: LirExpr; right: LirExpr; desc: 'D' }
     | { k: 'dneg'; operand: LirExpr; desc: 'D' }
+    /** Numeric conversion between a double and another JVM numeric type (int, long, float, short, byte, char). */
+    | { k: 'convert'; operand: LirExpr; desc: Desc }
     /** Double comparison; codegen picks dcmpl/dcmpg so NaN makes every comparison false. */
     | { k: 'dcmp'; op: CompareOp; left: LirExpr; right: LirExpr; desc: 'Z' }
     /** String value equality (`String.equals`), negated for `!=`. */
@@ -100,7 +104,7 @@ export type LirExpr =
     /** Instance call: `virtual` for methods, `special` for constructors and super calls. */
     | {
           k: 'invoke';
-          kind: 'virtual' | 'special';
+          kind: 'virtual' | 'special' | 'interface';
           owner: string;
           name: string;
           descriptor: string;

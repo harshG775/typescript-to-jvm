@@ -1,21 +1,25 @@
 import * as ts from 'typescript';
+import { parseMethodDescriptor } from '../classfile/descriptors.ts';
 import { errorAtNode, FrontendError } from './errors.ts';
-import type {
-    HirBinaryOp,
-    HirClass,
-    HirExpr,
-    HirFunction,
-    HirLocal,
-    HirParam,
-    HirProgram,
-    HirStmt,
-    ValueType,
+import {
+    descriptorOf,
+    type HirBinaryOp,
+    type HirClass,
+    type HirExpr,
+    type HirFunction,
+    type HirLocal,
+    type HirParam,
+    type HirProgram,
+    type HirStmt,
+    type ValueType,
 } from './hir.ts';
-import type { ForeignClassInfo, ForeignMethod } from './type-registry.ts';
+import type { ClassResolver, ForeignMethod } from './type-registry.ts';
 
 export interface CompileOptions {
-    registry: Map<string, ForeignClassInfo>;
+    classes: ClassResolver;
     fileName: string;
+    /** Prepended to user class names to form JVM internal names, e.g. `com/example/app/`. */
+    classPrefix?: string;
 }
 
 const F64: ValueType = { kind: 'f64' };
@@ -23,7 +27,8 @@ const BOOLEAN: ValueType = { kind: 'boolean' };
 const STRING: ValueType = { kind: 'string' };
 const NULL: ValueType = { kind: 'null' };
 const VOID: ValueType = { kind: 'void' };
-const OBJECT: ValueType = { kind: 'object', className: 'java/lang/Object' };
+const OBJECT_NAME = 'java/lang/Object';
+const OBJECT: ValueType = { kind: 'object', className: OBJECT_NAME };
 
 interface VarInfo {
     slot: number;
@@ -35,10 +40,18 @@ interface FunctionSig {
     returnType: ValueType;
 }
 
+/** Methods and constructors, user-written or from an existing class, share one shape. */
+type Method = ForeignMethod;
+
 interface ClassSig {
+    /** JVM internal name. */
+    internal: string;
+    /** JVM internal name of the superclass. */
+    superName: string;
     fields: Map<string, ValueType>;
-    ctorParams: ValueType[];
-    methods: Map<string, FunctionSig>;
+    /** The explicit constructor, if the class has one. */
+    ctor: Method | null;
+    methods: Map<string, Method>;
 }
 
 type Callable = ts.FunctionDeclaration | ts.MethodDeclaration;
@@ -49,7 +62,7 @@ interface FnCtx {
     nextSlot: number;
     locals: HirLocal[];
     returnType: ValueType;
-    /** Name of the enclosing class inside methods and constructors, else null. */
+    /** JVM internal name of the enclosing class inside methods and constructors, else null. */
     thisClass: string | null;
 }
 
@@ -81,7 +94,7 @@ function createProgram(sourceText: string, fileName: string): { program: ts.Prog
         target: ts.ScriptTarget.ES2020,
         module: ts.ModuleKind.None,
         skipLibCheck: true,
-        noResolve: true, // v1: no imports
+        noResolve: true, // imports are Java packages, not files
         types: [], // don't pull in @types/* from the surrounding project
     };
 
@@ -113,12 +126,6 @@ function slotsOf(t: ValueType): number {
 
 function typesEqual(a: ValueType, b: ValueType): boolean {
     return a.kind === b.kind && (a.kind !== 'object' || b.kind !== 'object' || a.className === b.className);
-}
-
-/** Exact match, or widening of any value to java/lang/Object. */
-function assignable(from: ValueType, to: ValueType): boolean {
-    if (from.kind === 'void') return false;
-    return typesEqual(from, to) || (to.kind === 'object' && to.className === 'java/lang/Object');
 }
 
 function typeOf(e: HirExpr): ValueType {
@@ -153,36 +160,62 @@ function describe(t: ValueType): string {
     return t.kind === 'object' ? t.className : t.kind;
 }
 
+function methodOf(name: string, sig: FunctionSig): Method {
+    const descriptor = `(${sig.params.map(descriptorOf).join('')})${descriptorOf(sig.returnType)}`;
+    return { name, params: sig.params, returnType: sig.returnType, isStatic: false, descriptor };
+}
+
+const IMPLICIT_CTOR: Method = { name: '<init>', params: [], returnType: VOID, isStatic: false, descriptor: '()V' };
+
 class Lowerer {
     private readonly checker: ts.TypeChecker;
-    private readonly registry: Map<string, ForeignClassInfo>;
+    private readonly resolver: ClassResolver;
+    private readonly prefix: string;
     private readonly functions = new Map<string, FunctionSig>();
+    /** User classes by their TS name, and by JVM internal name. */
     private readonly classes = new Map<string, ClassSig>();
+    private readonly byInternal = new Map<string, ClassSig>();
+    /** Names that refer to existing JVM classes (imports and the implicit `Math`): local name -> internal name. */
+    private readonly foreign = new Map<string, string>();
     private fn!: FnCtx;
 
     constructor(checker: ts.TypeChecker, opts: CompileOptions) {
         this.checker = checker;
-        this.registry = opts.registry;
+        this.resolver = opts.classes;
+        this.prefix = opts.classPrefix ?? '';
     }
 
     // ---- top level ---------------------------------------------------------
 
     lowerFile(sf: ts.SourceFile): HirProgram {
+        if (this.resolver.lookup('java/lang/Math')) this.foreign.set('Math', 'java/lang/Math');
+
         const fnDecls: ts.FunctionDeclaration[] = [];
         const classDecls: ts.ClassDeclaration[] = [];
         // Pass 1: names, so signatures can mention classes declared later in the file.
         for (const stmt of sf.statements) {
-            if (ts.isFunctionDeclaration(stmt)) {
+            if (ts.isImportDeclaration(stmt)) {
+                this.declareImport(stmt);
+            } else if (ts.isFunctionDeclaration(stmt)) {
                 fnDecls.push(stmt);
             } else if (ts.isClassDeclaration(stmt)) {
                 const name = this.classNameOf(stmt);
-                this.classes.set(name, { fields: new Map(), ctorParams: [], methods: new Map() });
+                const sig: ClassSig = {
+                    internal: this.prefix + name,
+                    superName: OBJECT_NAME,
+                    fields: new Map(),
+                    ctor: null,
+                    methods: new Map(),
+                };
+                this.classes.set(name, sig);
+                this.byInternal.set(sig.internal, sig);
                 classDecls.push(stmt);
             } else {
                 errorAtNode(stmt, 'unsupported top-level statement');
             }
         }
-        // Pass 2: signatures.
+        // Pass 2: superclasses, then signatures.
+        for (const decl of classDecls) this.resolveSuper(decl);
         for (const decl of fnDecls) {
             this.validateCallable(decl);
             const name = decl.name!.text;
@@ -197,15 +230,61 @@ class Lowerer {
         };
     }
 
+    /** `import { Activity } from 'android.app'` binds `Activity` to `android/app/Activity`. */
+    private declareImport(node: ts.ImportDeclaration): void {
+        const clause = node.importClause;
+        const bindings = clause?.namedBindings;
+        if (!clause || clause.name || !bindings || !ts.isNamedImports(bindings)) {
+            errorAtNode(node, "only named imports are supported: import { Name } from 'java.package'");
+        }
+        const module = (node.moduleSpecifier as ts.StringLiteral).text;
+        if (!/^[A-Za-z_]\w*(\.[A-Za-z_]\w*)*$/.test(module)) {
+            errorAtNode(node.moduleSpecifier, `'${module}' is not a Java package (for example 'android.widget')`);
+        }
+        for (const el of bindings.elements) {
+            const imported = (el.propertyName ?? el.name).text;
+            const local = el.name.text;
+            const internal = `${module.replaceAll('.', '/')}/${imported}`;
+            if (!this.resolver.lookup(internal)) errorAtNode(el, `class '${module}.${imported}' not found`);
+            if (this.foreign.has(local) || this.classes.has(local)) errorAtNode(el.name, `duplicate name '${local}'`);
+            this.foreign.set(local, internal);
+        }
+    }
+
     private classNameOf(node: ts.ClassDeclaration): string {
         if (!node.name) errorAtNode(node, 'anonymous classes are not supported');
         const name = node.name.text;
-        if (this.classes.has(name)) errorAtNode(node.name, `duplicate class '${name}'`);
+        if (this.classes.has(name) || this.foreign.has(name)) errorAtNode(node.name, `duplicate class '${name}'`);
         for (const m of node.modifiers ?? []) errorAtNode(m, `unsupported modifier '${m.getText()}'`);
-        if (node.heritageClauses?.length)
-            errorAtNode(node.heritageClauses[0]!, 'class inheritance is not supported yet');
         if (node.typeParameters?.length) errorAtNode(node, 'generic classes are not supported in v1');
         return name;
+    }
+
+    /** `class A extends B`: B is a user class or an imported class. */
+    private resolveSuper(node: ts.ClassDeclaration): void {
+        const sig = this.classes.get(node.name!.text)!;
+        const clauses = node.heritageClauses ?? [];
+        if (clauses.length === 0) return;
+        const clause = clauses[0]!;
+        if (clause.token !== ts.SyntaxKind.ExtendsKeyword || clauses.length > 1) {
+            errorAtNode(clause, "'implements' is not supported yet");
+        }
+        const target = clause.types[0]!;
+        if (!ts.isIdentifier(target.expression) || target.typeArguments?.length) {
+            errorAtNode(target, 'a class can only extend a plain class name');
+        }
+        const name = target.expression.text;
+        const internal = this.classes.get(name)?.internal ?? this.foreign.get(name);
+        if (!internal) errorAtNode(target, `unknown class '${name}'`);
+        if (this.resolver.lookup(internal)?.isInterface) errorAtNode(target, `cannot extend interface '${name}'`);
+        sig.superName = internal;
+
+        let steps = 0;
+        for (let c = this.byInternal.get(internal); c; c = this.byInternal.get(c.superName)) {
+            if (c === sig || ++steps > this.classes.size) {
+                errorAtNode(node, `circular inheritance involving '${name}'`);
+            }
+        }
     }
 
     private validateParams(params: ts.NodeArray<ts.ParameterDeclaration>): void {
@@ -234,12 +313,17 @@ class Lowerer {
         this.validateParams(node.parameters);
     }
 
+    private paramType(p: ts.ParameterDeclaration): ValueType {
+        return (p.type && this.typeFromNode(p.type)) || this.mapType(this.checker.getTypeAtLocation(p), p);
+    }
+
     private signatureOf(node: Callable): FunctionSig {
-        const params = node.parameters.map((p) => this.mapType(this.checker.getTypeAtLocation(p), p));
+        const params = node.parameters.map((p) => this.paramType(p));
+        const declared = node.type && this.typeFromNode(node.type);
+        if (declared) return { params, returnType: declared };
         const sig = this.checker.getSignatureFromDeclaration(node);
         if (!sig) errorAtNode(node, 'cannot resolve function signature');
-        const returnType = this.mapType(this.checker.getReturnTypeOfSignature(sig), node, 'return');
-        return { params, returnType };
+        return { params, returnType: this.mapType(this.checker.getReturnTypeOfSignature(sig), node, 'return') };
     }
 
     private declareClass(node: ts.ClassDeclaration): void {
@@ -256,23 +340,48 @@ class Lowerer {
                 const fname = member.name.text;
                 if (sig.fields.has(fname) || sig.methods.has(fname))
                     errorAtNode(member.name, `duplicate member '${fname}'`);
-                sig.fields.set(fname, this.mapType(this.checker.getTypeAtLocation(member.name), member.name));
+                const type =
+                    (member.type && this.typeFromNode(member.type)) ||
+                    this.mapType(this.checker.getTypeAtLocation(member.name), member.name);
+                sig.fields.set(fname, type);
             } else if (ts.isMethodDeclaration(member)) {
                 this.validateCallable(member);
                 const mname = (member.name as ts.Identifier).text;
                 if (sig.fields.has(mname) || sig.methods.has(mname))
                     errorAtNode(member.name, `duplicate member '${mname}'`);
-                sig.methods.set(mname, this.signatureOf(member));
+                const method = methodOf(mname, this.signatureOf(member));
+                this.checkOverride(sig, method, member.name);
+                sig.methods.set(mname, method);
             } else if (ts.isConstructorDeclaration(member)) {
                 if (sawCtor) errorAtNode(member, 'a class can have only one constructor');
                 sawCtor = true;
                 for (const m of member.modifiers ?? []) errorAtNode(m, `unsupported modifier '${m.getText()}'`);
                 if (!member.body) errorAtNode(member, 'constructor must have a body');
                 this.validateParams(member.parameters);
-                sig.ctorParams = member.parameters.map((p) => this.mapType(this.checker.getTypeAtLocation(p), p));
+                const params = member.parameters.map((p) => this.paramType(p));
+                sig.ctor = methodOf('<init>', { params, returnType: VOID });
             } else {
                 errorAtNode(member, `unsupported class member (${ts.SyntaxKind[member.kind]})`);
             }
+        }
+    }
+
+    /**
+     * A method that shares a name and arity with an inherited one must have its exact JVM signature, or it
+     * silently wouldn't override anything. (E.g. Android's `onKeyDown(int, KeyEvent)` takes an int, which a TS
+     * `number` parameter can't match.)
+     */
+    private checkOverride(sig: ClassSig, method: Method, node: ts.Node): void {
+        const inherited = this.methodsNamed(sig.superName, method.name).filter(
+            (m) => !m.isStatic && m.params.length === method.params.length,
+        );
+        if (inherited.length > 0 && !inherited.some((m) => m.descriptor === method.descriptor)) {
+            errorAtNode(
+                node,
+                `'${method.name}' doesn't match the JVM signature of the inherited method ` +
+                    `(${inherited.map((m) => m.descriptor).join(' or ')}; this one is ${method.descriptor}). ` +
+                    `Overriding methods that take Java int/float/long parameters isn't supported yet`,
+            );
         }
     }
 
@@ -284,24 +393,28 @@ class Lowerer {
         for (const member of node.members) {
             if (ts.isMethodDeclaration(member)) {
                 const mname = (member.name as ts.Identifier).text;
-                methods.push(this.lowerCallable(member, mname, sig.methods.get(mname)!, name));
+                const m = sig.methods.get(mname)!;
+                methods.push(this.lowerCallable(member, mname, m, sig.internal));
             } else if (ts.isConstructorDeclaration(member)) {
                 ctorNode = member;
             }
         }
         const fields = [...sig.fields].map(([fname, type]) => ({ name: fname, type }));
-        return { name, fields, ctor: this.lowerConstructor(node, ctorNode, sig), methods };
+        const { ctor, superCall } = this.lowerConstructor(node, ctorNode, sig);
+        return { name: sig.internal, superName: sig.superName, superCall, fields, ctor, methods };
     }
 
-    /** Field initializers run first, then the constructor body. They can't see the constructor's parameters. */
+    /**
+     * The super constructor call runs first, then field initializers, then the rest of the body.
+     * Initializers can't see the constructor's parameters; `super(...)` arguments can.
+     */
     private lowerConstructor(
         cls: ts.ClassDeclaration,
         node: ts.ConstructorDeclaration | undefined,
         sig: ClassSig,
-    ): HirFunction {
-        const name = cls.name!.text;
-        const self: ValueType = { kind: 'object', className: name };
-        this.fn = { scopes: [new Map()], nextSlot: 1, locals: [], returnType: VOID, thisClass: name };
+    ): { ctor: HirFunction; superCall: HirClass['superCall'] } {
+        const self: ValueType = { kind: 'object', className: sig.internal };
+        this.fn = { scopes: [new Map()], nextSlot: 1, locals: [], returnType: VOID, thisClass: sig.internal };
 
         const inits: HirStmt[] = [];
         for (const m of cls.members) {
@@ -309,28 +422,62 @@ class Lowerer {
             const fname = (m.name as ts.Identifier).text;
             const type = sig.fields.get(fname)!;
             const rhs = this.lowerExpr(m.initializer);
-            if (!assignable(typeOf(rhs), type)) {
+            if (!this.assignable(typeOf(rhs), type)) {
                 errorAtNode(m.initializer, `cannot assign ${describe(typeOf(rhs))} to ${describe(type)}`);
             }
             inits.push({
                 k: 'expr',
-                expr: { k: 'set-field', object: { k: 'this', type: self }, owner: name, name: fname, type, rhs },
+                expr: {
+                    k: 'set-field',
+                    object: { k: 'this', type: self },
+                    owner: sig.internal,
+                    name: fname,
+                    type,
+                    rhs,
+                },
             });
         }
 
+        const ctorSig = sig.ctor ?? IMPLICIT_CTOR;
         const params: HirParam[] = (node?.parameters ?? []).map((p, i) => {
             const pname = (p.name as ts.Identifier).text;
-            const type = sig.ctorParams[i]!;
+            const type = ctorSig.params[i]!;
             return { name: pname, type, slot: this.declareSlot(pname, type, p.name) };
         });
-        const body: HirStmt = node ? this.lowerStmt(node.body!) : { k: 'block', stmts: [] };
-        return {
+
+        let rest: readonly ts.Statement[] = node?.body?.statements ?? [];
+        const first = rest[0];
+        const superNode =
+            first &&
+            ts.isExpressionStatement(first) &&
+            ts.isCallExpression(first.expression) &&
+            first.expression.expression.kind === ts.SyntaxKind.SuperKeyword
+                ? first.expression
+                : undefined;
+        if (superNode) rest = rest.slice(1);
+
+        const superCtors = this.ctorsOf(sig.superName);
+        let superCall: HirClass['superCall'];
+        if (superNode) {
+            const { method, args } = this.resolveCall('super', superCtors, superNode.arguments, superNode);
+            superCall = { descriptor: method.descriptor, args };
+        } else {
+            const implicit = this.pick(superCtors, []);
+            if (!implicit) {
+                errorAtNode(cls, `'${sig.superName}' has no constructor without arguments; call super(...) explicitly`);
+            }
+            superCall = { descriptor: implicit.descriptor, args: [] };
+        }
+
+        const body: HirStmt = this.withScope(() => ({ k: 'block', stmts: rest.map((s) => this.lowerStmt(s)) }));
+        const ctor: HirFunction = {
             name: '<init>',
             params,
             returnType: VOID,
             locals: this.fn.locals,
             body: { k: 'block', stmts: [...inits, body] },
         };
+        return { ctor, superCall };
     }
 
     /** Lowers a function or method. In a method, slot 0 is `this` and parameters start at slot 1. */
@@ -355,6 +502,27 @@ class Lowerer {
 
     // ---- types -------------------------------------------------------------
 
+    /**
+     * Resolves a written type that names a class (`Bundle`, `Counter`, `Bundle | null`) without asking the checker,
+     * which can't see imported Java classes. Anything else returns undefined and goes through the checker.
+     */
+    private typeFromNode(node: ts.TypeNode): ValueType | undefined {
+        if (ts.isParenthesizedTypeNode(node)) return this.typeFromNode(node.type);
+        if (ts.isUnionTypeNode(node)) {
+            const isNullish = (t: ts.TypeNode): boolean =>
+                t.kind === ts.SyntaxKind.UndefinedKeyword ||
+                (ts.isLiteralTypeNode(t) && t.literal.kind === ts.SyntaxKind.NullKeyword);
+            const rest = node.types.filter((t) => !isNullish(t));
+            return rest.length === 1 && rest.length < node.types.length ? this.typeFromNode(rest[0]!) : undefined;
+        }
+        if (ts.isTypeReferenceNode(node) && ts.isIdentifier(node.typeName)) {
+            const name = node.typeName.text;
+            const internal = this.classes.get(name)?.internal ?? this.foreign.get(name);
+            return internal ? { kind: 'object', className: internal } : undefined;
+        }
+        return undefined;
+    }
+
     private mapType(type: ts.Type, node: ts.Node, position: 'value' | 'return' = 'value'): ValueType {
         const f = type.flags;
         if (f & ts.TypeFlags.NumberLike) return F64;
@@ -364,10 +532,133 @@ class Lowerer {
         if (f & ts.TypeFlags.Null) return NULL;
         if (f & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Union)) return OBJECT;
         const decl = type.symbol?.valueDeclaration;
-        if (decl && ts.isClassDeclaration(decl) && decl.name && this.classes.has(decl.name.text)) {
-            return { kind: 'object', className: decl.name.text };
+        if (decl && ts.isClassDeclaration(decl) && decl.name) {
+            const sig = this.classes.get(decl.name.text);
+            if (sig) return { kind: 'object', className: sig.internal };
         }
         return errorAtNode(node, `unsupported type '${this.checker.typeToString(type)}'`);
+    }
+
+    // ---- class hierarchy ---------------------------------------------------
+
+    private parentsOf(cls: string): string[] {
+        const user = this.byInternal.get(cls);
+        if (user) return [user.superName];
+        const f = this.resolver.lookup(cls);
+        return f ? [...(f.superName ? [f.superName] : []), ...f.interfaces] : [];
+    }
+
+    private isSubclass(a: string, b: string): boolean {
+        const seen = new Set<string>([a]);
+        for (const c of seen) {
+            if (c === b) return true;
+            for (const p of this.parentsOf(c)) seen.add(p);
+        }
+        return false;
+    }
+
+    /** Exact match, widening to Object (which boxes numbers and booleans), a subclass for a superclass, or null. */
+    private assignable(from: ValueType, to: ValueType): boolean {
+        if (from.kind === 'void') return false;
+        if (typesEqual(from, to)) return true;
+        if (to.kind !== 'object') return false;
+        if (to.className === OBJECT_NAME || from.kind === 'null') return true;
+        if (from.kind === 'object') return this.isSubclass(from.className, to.className);
+        if (from.kind === 'string') return this.isSubclass('java/lang/String', to.className);
+        return false;
+    }
+
+    /** All methods called `name` visible on `cls`: its own first, then inherited ones. */
+    private methodsNamed(cls: string, name: string): Method[] {
+        const found: Method[] = [];
+        const keys = new Set<string>();
+        const visited = new Set<string>([cls]);
+        for (const c of visited) {
+            const user = this.byInternal.get(c);
+            const own: Method[] = user
+                ? [user.methods.get(name)].filter((m) => m !== undefined)
+                : (this.resolver.lookup(c)?.methods.filter((m) => m.name === name) ?? []);
+            for (const m of own) {
+                const key = `${m.isStatic}${m.descriptor}`;
+                if (!keys.has(key)) {
+                    keys.add(key);
+                    found.push(m);
+                }
+            }
+            for (const p of this.parentsOf(c)) visited.add(p);
+        }
+        return found;
+    }
+
+    private ctorsOf(cls: string): Method[] {
+        const user = this.byInternal.get(cls);
+        if (user) return [user.ctor ?? IMPLICIT_CTOR];
+        return this.resolver.lookup(cls)?.ctors ?? [];
+    }
+
+    private fieldOf(cls: string, name: string): ValueType | undefined {
+        for (let c = this.byInternal.get(cls); c; c = this.byInternal.get(c.superName)) {
+            const f = c.fields.get(name);
+            if (f) return f;
+        }
+        return undefined;
+    }
+
+    // ---- overload resolution -----------------------------------------------
+
+    /** How well `from` fits a parameter (`to` in TS terms, `jvm` in JVM terms): undefined if it doesn't, else a cost. */
+    private argCost(from: ValueType, to: ValueType, jvm: string): number | undefined {
+        if (!this.assignable(from, to)) return undefined;
+        let cost = 0;
+        if (from.kind === 'f64' && jvm !== 'D' && jvm !== 'Ljava/lang/Object;') cost += 1; // narrowing to int/float/long
+        if (to.kind === 'object' && to.className === OBJECT_NAME && !typesEqual(from, to)) {
+            cost += from.kind === 'f64' || from.kind === 'boolean' ? 2 : 1; // boxing, or just a wide parameter
+        }
+        return cost;
+    }
+
+    /** The cheapest overload the arguments fit, or undefined. */
+    private pick(candidates: Method[], args: HirExpr[]): Method | undefined {
+        let best: Method | undefined;
+        let bestCost = Infinity;
+        for (const m of candidates) {
+            if (m.params.length !== args.length) continue;
+            const jvm = parseMethodDescriptor(m.descriptor).params;
+            let total: number | undefined = 0;
+            for (let i = 0; i < args.length && total !== undefined; i++) {
+                const c = this.argCost(typeOf(args[i]!), m.params[i]!, jvm[i]!);
+                total = c === undefined ? undefined : total + c;
+            }
+            if (total !== undefined && total < bestCost) {
+                best = m;
+                bestCost = total;
+            }
+        }
+        return best;
+    }
+
+    /** Lowers the arguments and chooses the overload. One candidate gets precise argument errors. */
+    private resolveCall(
+        label: string,
+        candidates: Method[],
+        argNodes: readonly ts.Expression[],
+        node: ts.Node,
+    ): { method: Method; args: HirExpr[] } {
+        if (candidates.length === 1) {
+            const only = candidates[0]!;
+            return { method: only, args: this.lowerArgs(argNodes, node, label, only.params) };
+        }
+        const args = argNodes.map((a) => this.lowerExpr(a));
+        const method = this.pick(candidates, args);
+        if (!method) {
+            const shape = (m: Method): string => `(${m.params.map(describe).join(', ')})`;
+            errorAtNode(
+                node,
+                `no overload of '${label}' accepts (${args.map((a) => describe(typeOf(a))).join(', ')})` +
+                    (candidates.length ? `; expected ${candidates.map(shape).join(' or ')}` : ''),
+            );
+        }
+        return { method, args };
     }
 
     // ---- scopes and slots --------------------------------------------------
@@ -457,8 +748,15 @@ class Lowerer {
 
         // Lower the initializer before declaring so `let x = x` can't see itself.
         const init = decl.initializer ? this.lowerExpr(decl.initializer) : null;
-        const type = this.mapType(this.checker.getTypeAtLocation(decl.name), decl.name);
-        if (init && !assignable(typeOf(init), type)) {
+        let type =
+            (decl.type && this.typeFromNode(decl.type)) ||
+            this.mapType(this.checker.getTypeAtLocation(decl.name), decl.name);
+        // The checker can't see imported Java classes (`new TextView(...)` is `any` to it), but the initializer knows.
+        if (!decl.type && init && typesEqual(type, OBJECT)) {
+            const t = typeOf(init);
+            if (t.kind === 'object') type = t;
+        }
+        if (init && !this.assignable(typeOf(init), type)) {
             errorAtNode(decl.initializer!, `cannot assign ${describe(typeOf(init))} to ${describe(type)}`);
         }
         const slot = this.declareLocal(decl.name.text, type, decl.name);
@@ -473,7 +771,7 @@ class Lowerer {
         }
         if (rt.kind === 'void') errorAtNode(node, 'cannot return a value from a void function');
         const expr = this.lowerExpr(node.expression);
-        if (!assignable(typeOf(expr), rt)) {
+        if (!this.assignable(typeOf(expr), rt)) {
             errorAtNode(
                 node.expression,
                 `cannot return ${describe(typeOf(expr))} from a function returning ${describe(rt)}`,
@@ -533,35 +831,34 @@ class Lowerer {
         return { k: 'this', type: { kind: 'object', className: cls } };
     }
 
-    /** The user class an expression's value is an instance of, or an error. */
-    private classOf(object: HirExpr, node: ts.Node): { name: string; sig: ClassSig } {
-        const t = typeOf(object);
-        const sig = t.kind === 'object' ? this.classes.get(t.className) : undefined;
-        if (t.kind !== 'object' || !sig) return errorAtNode(node, `'${describe(t)}' has no fields or methods`);
-        return { name: t.className, sig };
-    }
-
     private lowerFieldAccess(node: ts.PropertyAccessExpression): Extract<HirExpr, { k: 'field' }> {
         if (node.questionDotToken) errorAtNode(node, 'optional chaining is not supported');
         if (!ts.isIdentifier(node.name)) errorAtNode(node.name, 'private names are not supported');
         const object = this.lowerExpr(node.expression);
-        const { name: owner, sig } = this.classOf(object, node.expression);
-        const type = sig.fields.get(node.name.text);
+        const t = typeOf(object);
+        if (t.kind !== 'object') return errorAtNode(node.expression, `'${describe(t)}' has no fields or methods`);
+        const type = this.fieldOf(t.className, node.name.text);
         if (!type) {
-            const hint = sig.methods.has(node.name.text) ? ' (methods can only be called)' : '';
-            errorAtNode(node.name, `'${owner}' has no field '${node.name.text}'${hint}`);
+            const hint = this.methodsNamed(t.className, node.name.text).length ? ' (methods can only be called)' : '';
+            errorAtNode(node.name, `'${t.className}' has no field '${node.name.text}'${hint}`);
         }
-        return { k: 'field', object, owner, name: node.name.text, type };
+        return { k: 'field', object, owner: t.className, name: node.name.text, type };
     }
 
     private lowerNew(node: ts.NewExpression): HirExpr {
         if (node.typeArguments?.length) errorAtNode(node, 'type arguments are not supported');
         if (!ts.isIdentifier(node.expression)) return errorAtNode(node.expression, 'unsupported new target');
         const name = node.expression.text;
-        const sig = this.classes.get(name);
-        if (!sig) return errorAtNode(node.expression, `unknown class '${name}'`);
-        const args = this.lowerArgs(node.arguments ?? [], node, `new ${name}`, sig.ctorParams);
-        return { k: 'new', className: name, args, resultType: { kind: 'object', className: name } };
+        const internal = this.classes.get(name)?.internal ?? this.foreign.get(name);
+        if (!internal) return errorAtNode(node.expression, `unknown class '${name}'`);
+        const { method, args } = this.resolveCall(`new ${name}`, this.ctorsOf(internal), node.arguments ?? [], node);
+        return {
+            k: 'new',
+            className: internal,
+            descriptor: method.descriptor,
+            args,
+            resultType: { kind: 'object', className: internal },
+        };
     }
 
     private lowerIdentifier(node: ts.Identifier): HirExpr {
@@ -649,7 +946,7 @@ class Lowerer {
         if (ts.isPropertyAccessExpression(node.left)) {
             const target = this.lowerFieldAccess(node.left);
             const rhs = this.lowerExpr(node.right);
-            if (!assignable(typeOf(rhs), target.type)) {
+            if (!this.assignable(typeOf(rhs), target.type)) {
                 errorAtNode(node.right, `cannot assign ${describe(typeOf(rhs))} to ${describe(target.type)}`);
             }
             return {
@@ -665,11 +962,13 @@ class Lowerer {
         const v = this.lookup(node.left.text);
         if (!v) return errorAtNode(node.left, `unknown identifier '${node.left.text}'`);
         const rhs = this.lowerExpr(node.right);
-        if (!assignable(typeOf(rhs), v.type)) {
+        if (!this.assignable(typeOf(rhs), v.type)) {
             errorAtNode(node.right, `cannot assign ${describe(typeOf(rhs))} to ${describe(v.type)}`);
         }
         return { k: 'assign', slot: v.slot, type: v.type, rhs };
     }
+
+    // ---- calls -------------------------------------------------------------
 
     private lowerCall(node: ts.CallExpression): HirExpr {
         if (node.questionDotToken) errorAtNode(node, 'optional chaining is not supported');
@@ -677,10 +976,15 @@ class Lowerer {
         const callee = node.expression;
 
         if (ts.isIdentifier(callee)) return this.lowerLocalCall(node, callee);
+        if (callee.kind === ts.SyntaxKind.SuperKeyword) {
+            return errorAtNode(node, 'super(...) must be the first statement of a constructor');
+        }
         if (ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.name)) {
             const target = callee.expression;
-            if (ts.isIdentifier(target) && !this.lookup(target.text) && this.registry.has(target.text)) {
-                return this.lowerForeignCall(node, target, callee.name);
+            if (target.kind === ts.SyntaxKind.SuperKeyword) return this.lowerSuperMethodCall(node, callee.name);
+            if (ts.isIdentifier(target) && !this.lookup(target.text)) {
+                const internal = this.foreign.get(target.text);
+                if (internal) return this.lowerStaticCall(node, target.text, internal, callee.name);
             }
             return this.lowerMethodCall(node, callee, callee.name);
         }
@@ -696,17 +1000,62 @@ class Lowerer {
         return { k: 'call', calleeName: name, args, resultType: sig.returnType };
     }
 
+    /** `Math.abs(x)`, `Log.d(a, b)`: a static method of an existing class. */
+    private lowerStaticCall(node: ts.CallExpression, local: string, owner: string, method: ts.Identifier): HirExpr {
+        const qualified = `${local}.${method.text}`;
+        const candidates = this.methodsNamed(owner, method.text).filter((m) => m.isStatic);
+        if (candidates.length === 0) errorAtNode(method, `unknown method '${qualified}'`);
+        const { method: chosen, args } = this.resolveCall(qualified, candidates, node.arguments, node);
+        return {
+            k: 'call',
+            calleeName: qualified,
+            args,
+            resultType: chosen.returnType,
+            foreign: { owner, method: chosen },
+        };
+    }
+
     private lowerMethodCall(
         node: ts.CallExpression,
         callee: ts.PropertyAccessExpression,
-        method: ts.Identifier,
+        name: ts.Identifier,
     ): HirExpr {
         const object = this.lowerExpr(callee.expression);
-        const { name: owner, sig } = this.classOf(object, callee.expression);
-        const msig = sig.methods.get(method.text);
-        if (!msig) return errorAtNode(method, `'${owner}' has no method '${method.text}'`);
-        const args = this.lowerArgs(node.arguments, node, `${owner}.${method.text}`, msig.params);
-        return { k: 'call-method', object, owner, name: method.text, args, resultType: msig.returnType };
+        const t = typeOf(object);
+        if (t.kind !== 'object') return errorAtNode(callee.expression, `'${describe(t)}' has no fields or methods`);
+        const candidates = this.methodsNamed(t.className, name.text).filter((m) => !m.isStatic);
+        if (candidates.length === 0) errorAtNode(name, `'${t.className}' has no method '${name.text}'`);
+        const { method, args } = this.resolveCall(`${t.className}.${name.text}`, candidates, node.arguments, node);
+        return {
+            k: 'call-method',
+            object,
+            owner: t.className,
+            name: name.text,
+            descriptor: method.descriptor,
+            args,
+            resultType: method.returnType,
+            ...(this.resolver.lookup(t.className)?.isInterface ? { iface: true as const } : {}),
+        };
+    }
+
+    /** `super.m(args)`: a non-virtual call to the superclass's method. */
+    private lowerSuperMethodCall(node: ts.CallExpression, name: ts.Identifier): HirExpr {
+        const cls = this.fn.thisClass;
+        const sig = cls ? this.byInternal.get(cls) : undefined;
+        if (!cls || !sig) return errorAtNode(node, "'super' is only available inside class methods");
+        const candidates = this.methodsNamed(sig.superName, name.text).filter((m) => !m.isStatic);
+        if (candidates.length === 0) errorAtNode(name, `'${sig.superName}' has no method '${name.text}'`);
+        const { method, args } = this.resolveCall(`super.${name.text}`, candidates, node.arguments, node);
+        return {
+            k: 'call-method',
+            object: { k: 'this', type: { kind: 'object', className: cls } },
+            owner: sig.superName,
+            name: name.text,
+            descriptor: method.descriptor,
+            args,
+            resultType: method.returnType,
+            special: true,
+        };
     }
 
     /** Checks the argument count and that each argument can be passed as its parameter type. */
@@ -721,7 +1070,7 @@ class Lowerer {
         }
         return argNodes.map((a, i) => {
             const arg = this.lowerExpr(a);
-            if (!assignable(typeOf(arg), params[i]!)) {
+            if (!this.assignable(typeOf(arg), params[i]!)) {
                 errorAtNode(
                     a,
                     `argument ${i + 1} of '${label}': cannot pass ${describe(typeOf(arg))} as ${describe(params[i]!)}`,
@@ -729,37 +1078,6 @@ class Lowerer {
             }
             return arg;
         });
-    }
-
-    private lowerForeignCall(node: ts.CallExpression, obj: ts.Identifier, method: ts.Identifier): HirExpr {
-        const qualified = `${obj.text}.${method.text}`;
-        const cls = this.registry.get(obj.text);
-        if (!cls || this.lookup(obj.text)) errorAtNode(node, `unsupported call target '${qualified}'`);
-        const candidates = cls.methods.filter((m) => m.name === method.text);
-        if (candidates.length === 0) errorAtNode(method, `unknown method '${qualified}'`);
-
-        const args = node.arguments.map((a) => this.lowerExpr(a));
-        const argTypes = args.map(typeOf);
-        const match: ForeignMethod | undefined = candidates.find(
-            (m) =>
-                m.isStatic &&
-                m.params.length === argTypes.length &&
-                m.params.every((p, i) => typesEqual(p, argTypes[i]!)),
-        );
-        if (!match) {
-            errorAtNode(
-                node,
-                `no overload of '${qualified}' accepts (${argTypes.map(describe).join(', ')}); expected ` +
-                    candidates.map((m) => `(${m.params.map(describe).join(', ')})`).join(' or '),
-            );
-        }
-        return {
-            k: 'call',
-            calleeName: qualified,
-            args,
-            resultType: match.returnType,
-            foreign: { owner: cls.jvmInternalName, method: match },
-        };
     }
 }
 

@@ -34,7 +34,7 @@ export function generateClasses(program: LirProgram, opts: CodegenOptions = {}):
     const sourceFile = opts.sourceFile === undefined ? {} : { sourceFile: opts.sourceFile };
 
     const files: ClassFile[] = program.classes.map((c) => {
-        const cw = new ClassWriter(c.name, sourceFile);
+        const cw = new ClassWriter(c.name, { ...sourceFile, superName: c.superName });
         for (const f of c.fields) cw.addField(Acc.PUBLIC, f.name, f.desc);
         for (const fn of [c.ctor, ...c.methods]) {
             cw.addMethod(Acc.PUBLIC, fn.name, fn.descriptor, (code) =>
@@ -406,6 +406,10 @@ class FunctionGen {
                 this.expr(e.right);
                 c.op(({ add: 'dadd', sub: 'dsub', mul: 'dmul', div: 'ddiv', rem: 'drem' } as const)[e.op]);
                 return;
+            case 'convert':
+                this.expr(e.operand);
+                this.convert(e.operand.desc, e.desc);
+                return;
             case 'dneg':
                 this.expr(e.operand);
                 c.op('dneg');
@@ -485,6 +489,7 @@ class FunctionGen {
                 this.expr(e.object);
                 for (const a of e.args) this.expr(a);
                 if (e.kind === 'special') c.invokespecial(e.owner, e.name, e.descriptor);
+                else if (e.kind === 'interface') c.invokeinterface(e.owner, e.name, e.descriptor);
                 else c.invokevirtual(e.owner, e.name, e.descriptor);
                 return;
             case 'checkcast':
@@ -497,6 +502,25 @@ class FunctionGen {
                 this.expr(e.message);
                 c.invokespecial('java/lang/RuntimeException', '<init>', '(Ljava/lang/String;)V');
                 return;
+        }
+    }
+
+    /** double <-> int/long/float/short/byte/char, with Java's narrowing semantics. */
+    private convert(from: string, to: string): void {
+        const c = this.c;
+        if (from === 'D') {
+            if (to === 'J') c.op('d2l');
+            else if (to === 'F') c.op('d2f');
+            else {
+                c.op('d2i');
+                if (to === 'S') c.op('i2s');
+                else if (to === 'B') c.op('i2b');
+                else if (to === 'C') c.op('i2c');
+            }
+        } else if (to === 'D') {
+            c.op(from === 'J' ? 'l2d' : from === 'F' ? 'f2d' : 'i2d');
+        } else {
+            throw new Error(`cannot convert ${from} to ${to}`);
         }
     }
 

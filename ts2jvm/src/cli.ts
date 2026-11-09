@@ -2,15 +2,14 @@
 import { parseArgs } from 'node:util';
 import { buildApk } from './android/build-apk.ts';
 import { run } from './android/sdk.ts';
-import { compileFileToClasses, writeClassFiles } from './compile.ts';
+import { compileFileToClasses, defaultClassResolver, writeClassFiles } from './compile.ts';
 import { compileFileToHir } from './frontend/compile-file.ts';
 import { FrontendError } from './frontend/errors.ts';
-import { createDefaultRegistry } from './frontend/type-registry.ts';
 import { lowerHirToLir } from './middle/lower-hir-to-lir.ts';
 
 const USAGE = `ts2jvm <command> [file.ts]      (file defaults to src/main.ts)
 
-  compile  [--out build/classes] [--class Main]   write <out>/<Class>.class
+  compile  [--out build/classes] [--package a.b]  write one .class per TS class, plus Main for functions
   show     [--stage hir|lir]                      print an intermediate representation as JSON
   apk      [--out build/app.apk] [--package id] [--install]
                                                   build a signed debug APK; file must define main()`;
@@ -21,7 +20,6 @@ function main(argv: string[]): void {
         allowPositionals: true,
         options: {
             out: { type: 'string' },
-            class: { type: 'string' },
             stage: { type: 'string' },
             package: { type: 'string' },
             install: { type: 'boolean' },
@@ -32,14 +30,14 @@ function main(argv: string[]): void {
     switch (command) {
         case 'compile': {
             const paths = writeClassFiles(
-                compileFileToClasses(file, values.class ?? 'Main'),
+                compileFileToClasses(file, values.package ? { package: values.package } : {}),
                 values.out ?? 'build/classes',
             );
             for (const p of paths) console.log(`wrote ${p}`);
             return;
         }
         case 'show': {
-            const hir = compileFileToHir(file, createDefaultRegistry());
+            const hir = compileFileToHir(file, defaultClassResolver());
             const ir = (values.stage ?? 'lir') === 'hir' ? hir : lowerHirToLir(hir, { className: 'Main' });
             console.log(JSON.stringify(ir, null, 2));
             return;

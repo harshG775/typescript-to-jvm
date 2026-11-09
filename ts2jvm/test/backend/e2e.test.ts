@@ -3,6 +3,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vite-plus/test';
+import { findAndroidSdk } from '../../src/android/sdk.ts';
 import { compileSourceToClasses, writeClassFiles } from '../../src/compile.ts';
 
 /**
@@ -191,5 +192,65 @@ describe('TypeScript classes on the JVM', () => {
 
     it('rejects a class that collides with the top-level functions class', () => {
         expect(() => compileSourceToClasses('class Main {}', { fileName: 't.ts' })).toThrow(/collides/);
+    });
+});
+
+describe('inheritance on the JVM', () => {
+    it('extends, super(...), super.method(), overriding, polymorphism and inherited fields', () => {
+        const ts = `
+            class Animal {
+                name: string;
+                constructor(name: string) { this.name = name; }
+                speak(): string { return this.name + " makes a sound"; }
+            }
+            class Dog extends Animal {
+                tricks: number = 3;
+                constructor(name: string) { super(name + "!"); }
+                speak(): string { return super.speak() + " (woof)"; }
+                label(): string { return this.name + "/" + this.tricks; }
+            }
+            function describe(a: Animal): string { return a.speak(); }
+            function run(): string { return describe(new Dog("rex")); }
+            function plain(): string { return describe(new Animal("cat")); }
+            function label(): string { return new Dog("d").label(); }
+        `;
+        const java = `
+            System.out.println(Main.run());
+            System.out.println(Main.plain());
+            System.out.println(Main.label());
+            Animal a = new Dog("x");
+            System.out.println(a.speak() + " " + (a instanceof Dog));
+        `;
+        expect(run(ts, java)).toEqual([
+            'rex! makes a sound (woof)',
+            'cat makes a sound',
+            'd!/3',
+            'x! makes a sound (woof) true',
+        ]);
+    });
+});
+
+describe.skipIf(!findAndroidSdk())('calling real Java classes (types read from android.jar)', () => {
+    it('static and instance calls, int and interface parameters, overload choice', () => {
+        const ts = `
+            import { Integer, StringBuilder, CharSequence } from 'java.lang';
+            function hex(n: number): string { return Integer.toHexString(n); }
+            function parse(s: string): number { return Integer.parseInt(s) + 1; }
+            function build(): string {
+                const sb = new StringBuilder();
+                sb.append("a").append(1).append("b").append(true);
+                return sb.toString();
+            }
+            function len(c: CharSequence): number { return c.length(); }
+            function smallest(a: number, b: number): number { return Math.min(a, b); }
+        `;
+        const java = `
+            System.out.println(Main.hex(255));
+            System.out.println(Main.parse("41"));
+            System.out.println(Main.build());
+            System.out.println(Main.len("abcd"));
+            System.out.println(Main.smallest(3, 2));
+        `;
+        expect(run(ts, java)).toEqual(['ff', '42.0', 'a1.0btrue', '4.0', '2.0']);
     });
 });

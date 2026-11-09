@@ -1,19 +1,18 @@
-class Counter {
-    count: number = 0;
+import { Activity } from 'android.app';
+import { Bundle } from 'android.os';
+import { Log } from 'android.util';
+import { TextView } from 'android.widget';
 
-    inc(): number {
-        this.count = this.count + 1;
-        return this.count;
+class MainActivity extends Activity {
+    taps: number = 0;
+
+    onCreate(savedInstanceState: Bundle | null): void {
+        super.onCreate(savedInstanceState);
+        Log.d('ts2jvm', 'onCreate from a TypeScript Activity');
+
+        const view = new TextView(this);
+        view.setText('Hello from an Activity written in TypeScript');
+        view.setTextSize(24);
+        this.setContentView(view);
     }
-
-    describe(): string {
-        return 'count = ' + this.count;
-    }
-}
-
-function main(): void {
-    const c = new Counter();
-    c.inc();
-    c.inc();
-    Log.d('ts2jvm', 'Hello from TypeScript on the JVM, ' + c.describe());
 }

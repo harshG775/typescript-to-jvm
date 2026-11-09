@@ -24,7 +24,7 @@ package.json     scripts: build, apk, install:device; depends on ts2jvm
 ts2jvm/          the compiler package (CLI: ts2jvm)
   src/             frontend, middle, backend, classfile, android, cli.ts
   test/            compiler tests
-  types/           ambient .d.ts for classes the app can call (Log)
+  types/           hand-written .d.ts for the Android/Java modules apps import (editor only)
   examples/        bytecode-compare: the same code in TS and Kotlin, to compare javap output
 ```
 
@@ -36,7 +36,7 @@ pnpm typecheck        # typecheck your app (src/)
 pnpm build            # src/main.ts -> build/classes/Main.class
 pnpm apk              # src/main.ts -> build/app.apk (needs ANDROID_HOME)
 pnpm install:device   # same, then adb install
-pnpm test:compiler    # compiler tests (64)
+pnpm test:compiler    # compiler tests (74)
 pnpm lint             # oxlint (config: .oxlintrc.json); lint:fix applies safe fixes
 pnpm format           # oxfmt (config: .oxfmtrc.json); format:check only verifies
 pnpm check            # lint + format:check + both typechecks
@@ -79,7 +79,7 @@ The CLI is a `.ts` file run directly by Node. That works here because the worksp
 - [x] Define the LIR (`ts2jvm/src/middle/lir.ts`): JVM-typed tree, descriptors as types, structured control flow
 - [x] Lowering pass (`ts2jvm/src/middle/lower-hir-to-lir.ts`): boxing to `Object`, string concat chains, `String.equals`, throwable wrapping, call descriptors
 - [x] Tests (`ts2jvm/test/middle/lir.test.ts`)
-- [x] HIR `call` carries the resolved foreign overload; `ForeignMethod.jvmDescriptor` for `Log` (real return is `int`)
+- [x] HIR `call` carries the resolved foreign overload; `ForeignMethod.descriptor` is the real JVM signature (`Log.d` returns `int`)
 - [x] `throw` accepts only strings (wrapped in `RuntimeException`) or a caught error (rethrown)
 
 ### Phase 4: Codegen and first end-to-end run
@@ -96,16 +96,20 @@ The CLI is a `.ts` file run directly by Node. That works here because the worksp
 - [x] Activity stub generated with our own `ClassWriter`; its `onCreate` calls the TS `main()`
 - [x] Run the APK on a device: `Log.d` from TS shows in logcat (`adb logcat -s ts2jvm`) and the Activity renders
 - [ ] Gradle task (only if the script approach stops being enough)
-- [ ] `.d.ts` and registry generated from `android.jar`
-- [ ] `Activity` written in TS (needs classes, Phase 6)
+- [x] Classes are read from `android.jar` on demand (zip + class-file reader), so any public class can be imported
+- [ ] Generate the editor `.d.ts` from `android.jar` (today `ts2jvm/types/index.d.ts` is hand-written and small)
+- [x] `Activity` written in TS: `src/main.ts` declares `class MainActivity extends Activity`, running on a phone
 
 ### Phase 6: Language growth
 
 - [x] User classes: fields (with initializers), constructor, methods, `this`, `new`, field access/assignment, method calls; one `.class` per TS class
-- [ ] Classes that `extends` a foreign class (`Activity`), `super` calls, overriding
-- [ ] Calling instance methods and `new` on foreign (Android) classes, with subtype-aware assignability
-- [ ] `int`: foreign `int` params/returns convert from/to `number` (d2i / i2d) instead of adding a TS-level int type
-- [ ] Arrays, interfaces, user-class inheritance, `for`/`switch`
+- [x] `import { Activity } from 'android.app'`: the module is the Java package, the name is the class
+- [x] `extends` an imported or user class; `super(...)`, `super.method()`, overriding; a method that would not override (different JVM signature) is an error
+- [x] `new` and instance/static calls on imported classes, interface receivers (`invokeinterface`), overload choice (cheapest conversion wins), subtype-aware assignability
+- [x] `int`/`float`/`long`: `number` is converted (d2i, d2f, ...) at each Java call; Java results are converted back to `number`. No TS-level int type
+- [ ] Static fields and constants (`View.VISIBLE`), instance fields on Java classes
+- [ ] Overriding Java methods that take int/float parameters (`onKeyDown(int, KeyEvent)`)
+- [ ] Interfaces (`implements`), listeners, arrays, `for`/`switch`
 - [ ] Generics, closures, async
 
 ### Phase 7: Tooling

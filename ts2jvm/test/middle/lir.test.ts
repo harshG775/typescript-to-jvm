@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vite-plus/test';
 import { compileSourceToHir } from '../../src/frontend/compile-file.ts';
-import { createDefaultRegistry } from '../../src/frontend/type-registry.ts';
+import { builtinResolver } from '../../src/frontend/builtin-classes.ts';
 import type { LirFunction, LirProgram, LirStmt } from '../../src/middle/lir.ts';
 import { lowerHirToLir } from '../../src/middle/lower-hir-to-lir.ts';
 
@@ -8,7 +8,7 @@ const OBJECT = 'Ljava/lang/Object;';
 const STRING = 'Ljava/lang/String;';
 
 function lower(source: string): LirProgram {
-    const hir = compileSourceToHir(source, { registry: createDefaultRegistry(), fileName: 'test.ts' });
+    const hir = compileSourceToHir(source, { classes: builtinResolver(), fileName: 'test.ts' });
     return lowerHirToLir(hir, { className: 'app/Main' });
 }
 
@@ -112,8 +112,8 @@ describe('HIR -> LIR', () => {
         ]);
     });
 
-    it('keeps the real JVM descriptor for Log (int) while exposing boolean', () => {
-        const fn = only('function f():void{ Log.d("t", "m"); }');
+    it('keeps the real JVM descriptor for Log (int); a discarded result is not converted', () => {
+        const fn = only(`import { Log } from 'android.util'; function f():void{ Log.d("t", "m"); }`);
         expect(stmts(fn)).toMatchObject([
             {
                 k: 'expr',
@@ -122,7 +122,7 @@ describe('HIR -> LIR', () => {
                     owner: 'android/util/Log',
                     name: 'd',
                     descriptor: `(${STRING}${STRING})I`,
-                    desc: 'Z',
+                    desc: 'I',
                 },
             },
         ]);
@@ -274,5 +274,59 @@ describe('HIR -> LIR: classes', () => {
     it('does not box a class instance widened to Object', () => {
         const fn = lower('class A {} function f(a: A): any { return a; }').functions[0]!;
         expect(stmts(fn)).toMatchObject([{ k: 'return', value: { k: 'load', desc: 'LA;' } }]);
+    });
+});
+
+describe('HIR -> LIR: Android classes', () => {
+    const IMPORTS = `import { Activity } from 'android.app'; import { Bundle } from 'android.os';
+        import { TextView } from 'android.widget'; import { Log } from 'android.util';`;
+
+    it('converts a number to the JVM float parameter, and the int result of Log.d back to a number', () => {
+        const fn = lower(`${IMPORTS} function f(tv: TextView): number { tv.setTextSize(20); return Log.d("a", "b"); }`)
+            .functions[0]!;
+        expect(stmts(fn)).toMatchObject([
+            {
+                k: 'expr',
+                expr: {
+                    k: 'invoke',
+                    kind: 'virtual',
+                    owner: 'android/widget/TextView',
+                    descriptor: '(F)V',
+                    args: [{ k: 'convert', desc: 'F', operand: { k: 'dconst', value: 20 } }],
+                },
+            },
+            { k: 'return', value: { k: 'convert', desc: 'D', operand: { k: 'call', desc: 'I', name: 'd' } } },
+        ]);
+    });
+
+    it('emits a constructor that calls the superclass constructor first, and keeps the superclass name', () => {
+        const { classes } = lower(`${IMPORTS} class S extends Activity { onCreate(b: Bundle | null): void {} }`);
+        const c = classes[0]!;
+        expect(c.superName).toBe('android/app/Activity');
+        expect(c.ctor.body).toMatchObject({
+            k: 'block',
+            stmts: [
+                { k: 'expr', expr: { k: 'invoke', kind: 'special', owner: 'android/app/Activity', descriptor: '()V' } },
+                { k: 'block' },
+            ],
+        });
+        expect(c.methods[0]!.descriptor).toBe('(Landroid/os/Bundle;)V');
+    });
+
+    it('uses invokeinterface for interface receivers, converting the int result', () => {
+        const fn = lower(
+            "import { CharSequence } from 'java.lang'; function f(c: CharSequence): number { return c.length(); }",
+        ).functions[0]!;
+        expect(fn.params[0]!.desc).toBe('Ljava/lang/CharSequence;');
+        expect(stmts(fn)).toMatchObject([
+            {
+                k: 'return',
+                value: {
+                    k: 'convert',
+                    desc: 'D',
+                    operand: { k: 'invoke', kind: 'interface', owner: 'java/lang/CharSequence', descriptor: '()I' },
+                },
+            },
+        ]);
     });
 });

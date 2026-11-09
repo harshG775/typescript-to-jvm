@@ -1,62 +1,51 @@
+import { parseMethodDescriptor } from '../classfile/descriptors.ts';
 import type { ValueType } from './hir.ts';
 
+/**
+ * A method or constructor of a class that already exists on the JVM (java.*, android.*).
+ * `params`/`returnType` are what TypeScript sees: every JVM numeric type (int, long, float, ...) is `f64`.
+ * `descriptor` is the real JVM signature; the middle end converts between the two at each call.
+ */
 export interface ForeignMethod {
     name: string;
     params: ValueType[];
     returnType: ValueType;
     isStatic: boolean;
-    /** Real JVM descriptor when it can't be derived from the TS-facing types (e.g. Log.d returns int). */
-    jvmDescriptor?: string;
+    descriptor: string;
 }
 
-export interface ForeignClassInfo {
-    tsName: string;
-    jvmInternalName: string;
+export interface ForeignClass {
+    /** JVM internal name, e.g. `android/app/Activity`. */
+    name: string;
+    superName: string | null;
+    interfaces: string[];
+    isInterface: boolean;
+    ctors: ForeignMethod[];
     methods: ForeignMethod[];
 }
 
-const F64: ValueType = { kind: 'f64' };
-const STRING: ValueType = { kind: 'string' };
-const BOOLEAN: ValueType = { kind: 'boolean' };
-
-function staticMethod(name: string, params: ValueType[], returnType: ValueType, jvmDescriptor?: string): ForeignMethod {
-    return jvmDescriptor === undefined
-        ? { name, params, returnType, isStatic: true }
-        : { name, params, returnType, isStatic: true, jvmDescriptor };
+/** Looks up classes by JVM internal name. Implemented by android.jar (real) and a small built-in table (tests). */
+export interface ClassResolver {
+    lookup(internalName: string): ForeignClass | undefined;
 }
 
-const LOG_DESC = '(Ljava/lang/String;Ljava/lang/String;)I';
+const NUMERIC = 'BCDFIJS';
 
-/** Hand-written foreign-class table, consulted at call sites by identifier text (not by TS type). */
-export function createDefaultRegistry(): Map<string, ForeignClassInfo> {
-    const registry = new Map<string, ForeignClassInfo>();
+/** Descriptor -> the TS-facing type, or undefined for types the language can't express yet (arrays). */
+export function typeFromDescriptor(desc: string): ValueType | undefined {
+    if (desc === 'V') return { kind: 'void' };
+    if (desc === 'Z') return { kind: 'boolean' };
+    if (desc.length === 1 && NUMERIC.includes(desc)) return { kind: 'f64' };
+    if (desc === 'Ljava/lang/String;') return { kind: 'string' };
+    if (desc.startsWith('L') && desc.endsWith(';')) return { kind: 'object', className: desc.slice(1, -1) };
+    return undefined;
+}
 
-    registry.set('Math', {
-        tsName: 'Math',
-        jvmInternalName: 'java/lang/Math',
-        methods: [
-            staticMethod('abs', [F64], F64),
-            staticMethod('floor', [F64], F64),
-            staticMethod('ceil', [F64], F64),
-            staticMethod('sqrt', [F64], F64),
-            staticMethod('random', [], F64),
-            staticMethod('min', [F64, F64], F64),
-            staticMethod('max', [F64, F64], F64),
-        ],
-    });
-
-    // NOTE: the real android.util.Log methods return `int`. v1 has no i32 type, so they are
-    // declared as returning boolean. Callers MUST discard the result; codegen can't use it.
-    registry.set('Log', {
-        tsName: 'Log',
-        jvmInternalName: 'android/util/Log',
-        methods: [
-            staticMethod('d', [STRING, STRING], BOOLEAN, LOG_DESC),
-            staticMethod('e', [STRING, STRING], BOOLEAN, LOG_DESC),
-            staticMethod('i', [STRING, STRING], BOOLEAN, LOG_DESC),
-            staticMethod('w', [STRING, STRING], BOOLEAN, LOG_DESC),
-        ],
-    });
-
-    return registry;
+/** Builds a ForeignMethod from a JVM descriptor, or undefined if it uses a type TS can't express (arrays). */
+export function methodFromDescriptor(name: string, descriptor: string, isStatic: boolean): ForeignMethod | undefined {
+    const d = parseMethodDescriptor(descriptor);
+    const params = d.params.map(typeFromDescriptor);
+    const returnType = typeFromDescriptor(d.returns);
+    if (!returnType || params.some((p) => p === undefined)) return undefined;
+    return { name, params: params as ValueType[], returnType, isStatic, descriptor };
 }

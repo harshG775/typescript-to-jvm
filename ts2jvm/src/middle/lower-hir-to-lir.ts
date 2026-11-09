@@ -1,4 +1,13 @@
-import type { HirClass, HirExpr, HirFunction, HirProgram, HirStmt, ValueType } from '../frontend/hir.ts';
+import { parseMethodDescriptor } from '../classfile/descriptors.ts';
+import {
+    descriptorOf,
+    type HirClass,
+    type HirExpr,
+    type HirFunction,
+    type HirProgram,
+    type HirStmt,
+    type ValueType,
+} from '../frontend/hir.ts';
 import {
     D_BOOLEAN,
     D_DOUBLE,
@@ -21,25 +30,10 @@ export interface LirOptions {
     className: string;
 }
 
-export function descOf(t: ValueType): Desc {
-    switch (t.kind) {
-        case 'f64':
-            return D_DOUBLE;
-        case 'boolean':
-            return D_BOOLEAN;
-        case 'string':
-            return D_STRING;
-        case 'null':
-            return D_OBJECT;
-        case 'void':
-            return D_VOID;
-        case 'object':
-            return `L${t.className};`;
-    }
-}
+export { descriptorOf as descOf };
 
 function functionDescriptor(fn: HirFunction): string {
-    return `(${fn.params.map((p) => descOf(p.type)).join('')})${descOf(fn.returnType)}`;
+    return `(${fn.params.map((p) => descriptorOf(p.type)).join('')})${descriptorOf(fn.returnType)}`;
 }
 
 const DOUBLE_OPS: Partial<Record<string, DoubleOp>> = { '+': 'add', '-': 'sub', '*': 'mul', '/': 'div', '%': 'rem' };
@@ -52,10 +46,12 @@ const COMPARE_OPS: Partial<Record<string, CompareOp>> = {
     '!=': '!=',
 };
 
+/** JVM numeric types that TypeScript sees as `number`; a double is converted to/from them at call boundaries. */
+const NARROW_NUMERIC = new Set(['I', 'J', 'F', 'S', 'B', 'C']);
+
 export function lowerHirToLir(program: HirProgram, opts: LirOptions): LirProgram {
     const fns = new Map(program.functions.map((f) => [f.name, f]));
-    const classes = new Map(program.classes.map((c) => [c.name, c]));
-    const lowerer = new Lowerer(opts.className, fns, classes);
+    const lowerer = new Lowerer(opts.className, fns);
     return {
         className: opts.className,
         functions: program.functions.map((f) => lowerer.lowerFunction(f)),
@@ -66,13 +62,11 @@ export function lowerHirToLir(program: HirProgram, opts: LirOptions): LirProgram
 class Lowerer {
     private readonly className: string;
     private readonly fns: Map<string, HirFunction>;
-    private readonly classes: Map<string, HirClass>;
     private returnType: ValueType = { kind: 'void' };
 
-    constructor(className: string, fns: Map<string, HirFunction>, classes: Map<string, HirClass>) {
+    constructor(className: string, fns: Map<string, HirFunction>) {
         this.className = className;
         this.fns = fns;
-        this.classes = classes;
     }
 
     lowerClass(c: HirClass): LirClass {
@@ -82,17 +76,18 @@ class Lowerer {
             expr: {
                 k: 'invoke',
                 kind: 'special',
-                owner: 'java/lang/Object',
+                owner: c.superName,
                 name: '<init>',
-                descriptor: '()V',
+                descriptor: c.superCall.descriptor,
                 object: { k: 'load', slot: 0, desc: `L${c.name};` },
-                args: [],
+                args: this.args(c.superCall.args, c.superCall.descriptor),
                 desc: D_VOID,
             },
         };
         return {
             name: c.name,
-            fields: c.fields.map((f) => ({ name: f.name, desc: descOf(f.type) })),
+            superName: c.superName,
+            fields: c.fields.map((f) => ({ name: f.name, desc: descriptorOf(f.type) })),
             ctor: { ...ctor, body: { k: 'block', stmts: [superCall, ctor.body] } },
             methods: c.methods.map((m) => this.lowerFunction(m)),
         };
@@ -103,8 +98,8 @@ class Lowerer {
         return {
             name: fn.name,
             descriptor: functionDescriptor(fn),
-            params: fn.params.map((p) => ({ name: p.name, desc: descOf(p.type), slot: p.slot })),
-            locals: fn.locals.map((l) => ({ name: l.name, desc: descOf(l.type), slot: l.slot })),
+            params: fn.params.map((p) => ({ name: p.name, desc: descriptorOf(p.type), slot: p.slot })),
+            locals: fn.locals.map((l) => ({ name: l.name, desc: descriptorOf(l.type), slot: l.slot })),
             body: this.stmt(fn.body),
         };
     }
@@ -116,8 +111,8 @@ class Lowerer {
             case 'block':
                 return { k: 'block', stmts: s.stmts.map((c) => this.stmt(c)) };
             case 'var-decl': {
-                const desc = descOf(s.type);
-                const value = s.init ? this.coerce(this.expr(s.init), s.type) : defaultValue(desc);
+                const desc = descriptorOf(s.type);
+                const value = s.init ? this.coerce(this.expr(s.init), desc) : defaultValue(desc);
                 return { k: 'store', slot: s.slot, desc, value };
             }
             case 'expr': {
@@ -125,6 +120,8 @@ class Lowerer {
                 // `x = v;` as a statement doesn't need the value left on the stack.
                 if (e.k === 'store') return { k: 'store', slot: e.slot, desc: e.desc, value: e.value };
                 if (e.k === 'putfield') return { ...e };
+                // A converted call result that is thrown away doesn't need converting.
+                if (e.k === 'convert') return { k: 'expr', expr: e.operand };
                 return { k: 'expr', expr: e };
             }
             case 'if':
@@ -137,7 +134,10 @@ class Lowerer {
             case 'while':
                 return { k: 'while', cond: this.expr(s.cond), body: this.stmt(s.body) };
             case 'return':
-                return { k: 'return', value: s.expr ? this.coerce(this.expr(s.expr), this.returnType) : null };
+                return {
+                    k: 'return',
+                    value: s.expr ? this.coerce(this.expr(s.expr), descriptorOf(this.returnType)) : null,
+                };
             case 'throw':
                 return { k: 'throw', expr: this.throwable(this.expr(s.expr)) };
             case 'try':
@@ -161,16 +161,30 @@ class Lowerer {
 
     // ---- expressions -------------------------------------------------------
 
-    /** Widens `e` to `to`. HIR only allows exact matches and widening to Object, which boxes primitives. */
-    private coerce(e: LirExpr, to: ValueType): LirExpr {
-        if (
-            to.kind === 'object' &&
-            to.className === 'java/lang/Object' &&
-            (e.desc === D_DOUBLE || e.desc === D_BOOLEAN)
-        ) {
+    /**
+     * Adapts `e` to a target JVM type. The front end only allows exact matches, subclasses (no change needed),
+     * and two widenings: a number or boolean into Object (boxing), and a number into a JVM int/long/float/... parameter.
+     */
+    private coerce(e: LirExpr, to: Desc): LirExpr {
+        if (e.desc === to) return e;
+        if (to === D_OBJECT && (e.desc === D_DOUBLE || e.desc === D_BOOLEAN)) {
             return { k: 'box', operand: e, desc: D_OBJECT };
         }
+        if (e.desc === D_DOUBLE && NARROW_NUMERIC.has(to)) return { k: 'convert', operand: e, desc: to };
         return e;
+    }
+
+    /** Lowers call arguments and adapts each to its parameter in `descriptor`. */
+    private args(args: HirExpr[], descriptor: string): LirExpr[] {
+        const params = parseMethodDescriptor(descriptor).params;
+        return args.map((a, i) => this.coerce(this.expr(a), params[i]!));
+    }
+
+    /** A call whose JVM return type is int/long/float/... is exposed to TypeScript as a double. */
+    private adaptReturn(call: Extract<LirExpr, { k: 'call' | 'invoke' }>, descriptor: string): LirExpr {
+        const ret = parseMethodDescriptor(descriptor).returns;
+        if (!NARROW_NUMERIC.has(ret)) return call;
+        return { k: 'convert', operand: { ...call, desc: ret }, desc: D_DOUBLE };
     }
 
     private expr(e: HirExpr): LirExpr {
@@ -185,75 +199,73 @@ class Lowerer {
             case 'undefined':
                 return { k: 'null', desc: D_OBJECT };
             case 'local':
-                return { k: 'load', slot: e.slot, desc: descOf(e.type) };
-            case 'assign':
-                return { k: 'store', slot: e.slot, desc: descOf(e.type), value: this.coerce(this.expr(e.rhs), e.type) };
+                return { k: 'load', slot: e.slot, desc: descriptorOf(e.type) };
+            case 'assign': {
+                const desc = descriptorOf(e.type);
+                return { k: 'store', slot: e.slot, desc, value: this.coerce(this.expr(e.rhs), desc) };
+            }
             case 'unary': {
                 const operand = this.expr(e.operand);
                 return e.op === '-' ? { k: 'dneg', operand, desc: D_DOUBLE } : { k: 'not', operand, desc: D_BOOLEAN };
             }
             case 'binary':
                 return this.binary(e);
-            case 'cond':
+            case 'cond': {
+                const desc = descriptorOf(e.resultType);
                 return {
                     k: 'cond',
                     cond: this.expr(e.cond),
-                    then: this.coerce(this.expr(e.then), e.resultType),
-                    else_: this.coerce(this.expr(e.else_), e.resultType),
-                    desc: descOf(e.resultType),
+                    then: this.coerce(this.expr(e.then), desc),
+                    else_: this.coerce(this.expr(e.else_), desc),
+                    desc,
                 };
+            }
             case 'call':
                 return this.call(e);
             case 'this':
-                return { k: 'load', slot: 0, desc: descOf(e.type) };
-            case 'new': {
-                const ctor = this.classOf(e.className).ctor;
+                return { k: 'load', slot: 0, desc: descriptorOf(e.type) };
+            case 'new':
                 return {
                     k: 'new',
                     cls: e.className,
-                    descriptor: functionDescriptor(ctor),
-                    args: e.args.map((a, i) => this.coerce(this.expr(a), ctor.params[i]!.type)),
-                    desc: descOf(e.resultType),
+                    descriptor: e.descriptor,
+                    args: this.args(e.args, e.descriptor),
+                    desc: descriptorOf(e.resultType),
                 };
-            }
             case 'field':
                 return {
                     k: 'getfield',
                     owner: e.owner,
                     name: e.name,
                     object: this.expr(e.object),
-                    desc: descOf(e.type),
+                    desc: descriptorOf(e.type),
                 };
-            case 'set-field':
+            case 'set-field': {
+                const desc = descriptorOf(e.type);
                 return {
                     k: 'putfield',
                     owner: e.owner,
                     name: e.name,
                     object: this.expr(e.object),
-                    value: this.coerce(this.expr(e.rhs), e.type),
-                    desc: descOf(e.type),
-                };
-            case 'call-method': {
-                const method = this.classOf(e.owner).methods.find((m) => m.name === e.name);
-                if (!method) throw new Error(`call to unknown method '${e.owner}.${e.name}'`);
-                return {
-                    k: 'invoke',
-                    kind: 'virtual',
-                    owner: e.owner,
-                    name: e.name,
-                    descriptor: functionDescriptor(method),
-                    object: this.expr(e.object),
-                    args: e.args.map((a, i) => this.coerce(this.expr(a), method.params[i]!.type)),
-                    desc: descOf(e.resultType),
+                    value: this.coerce(this.expr(e.rhs), desc),
+                    desc,
                 };
             }
+            case 'call-method':
+                return this.adaptReturn(
+                    {
+                        k: 'invoke',
+                        kind: e.special ? 'special' : e.iface ? 'interface' : 'virtual',
+                        owner: e.owner,
+                        name: e.name,
+                        descriptor: e.descriptor,
+                        object: this.expr(e.object),
+                        args: this.args(e.args, e.descriptor),
+                        desc: descriptorOf(e.resultType),
+                    },
+                    e.descriptor,
+                );
         }
-    }
-
-    private classOf(name: string): HirClass {
-        const c = this.classes.get(name);
-        if (!c) throw new Error(`unknown class '${name}'`);
-        return c;
     }
 
     private binary(e: Extract<HirExpr, { k: 'binary' }>): LirExpr {
@@ -279,22 +291,30 @@ class Lowerer {
     }
 
     private call(e: Extract<HirExpr, { k: 'call' }>): LirExpr {
-        const desc = descOf(e.resultType);
+        const desc = descriptorOf(e.resultType);
         if (e.foreign) {
             const { owner, method } = e.foreign;
-            const descriptor =
-                method.jvmDescriptor ?? `(${method.params.map(descOf).join('')})${descOf(method.returnType)}`;
-            return { k: 'call', owner, name: method.name, descriptor, args: e.args.map((a) => this.expr(a)), desc };
+            return this.adaptReturn(
+                {
+                    k: 'call',
+                    owner,
+                    name: method.name,
+                    descriptor: method.descriptor,
+                    args: this.args(e.args, method.descriptor),
+                    desc,
+                },
+                method.descriptor,
+            );
         }
         const target = this.fns.get(e.calleeName);
         if (!target) throw new Error(`call to unknown function '${e.calleeName}'`);
-        const args = e.args.map((a, i) => this.coerce(this.expr(a), target.params[i]!.type));
+        const descriptor = functionDescriptor(target);
         return {
             k: 'call',
             owner: this.className,
             name: target.name,
-            descriptor: functionDescriptor(target),
-            args,
+            descriptor,
+            args: this.args(e.args, descriptor),
             desc,
         };
     }

@@ -6,7 +6,10 @@ import { compileFileToClasses, writeClassFiles } from '../compile.ts';
 import { d8, findAndroidSdk, run } from './sdk.ts';
 
 export interface ApkOptions {
-    /** TypeScript file. It must define `function main(): void`, which runs when the activity opens. */
+    /**
+     * TypeScript file. Either declares `class MainActivity extends Activity`, or defines `function main(): void`,
+     * which a generated Activity runs when it opens.
+     */
     tsFile: string;
     outFile: string;
     /** Android application id. */
@@ -20,7 +23,7 @@ const TEXT_VIEW = 'android/widget/TextView';
  * Builds the one class Android needs that TypeScript can't express yet: an Activity whose onCreate
  * calls the compiled `Main.main()` and shows a line of text.
  */
-function buildActivity(className: string): Uint8Array {
+function buildActivity(className: string, mainClass: string): Uint8Array {
     const cw = new ClassWriter(className, { superName: ACTIVITY });
     cw.addMethod(Acc.PUBLIC, '<init>', '()V', (c) => {
         c.load('a', 0);
@@ -31,7 +34,7 @@ function buildActivity(className: string): Uint8Array {
         c.load('a', 0);
         c.load('a', 1);
         c.invokespecial(ACTIVITY, 'onCreate', '(Landroid/os/Bundle;)V');
-        c.invokestatic('Main', 'main', '()V');
+        c.invokestatic(mainClass, 'main', '()V');
 
         const view = c.newLocal('a');
         c.newObject(TEXT_VIEW);
@@ -72,11 +75,17 @@ export function buildApk(opts: ApkOptions): void {
     const pkg = opts.packageName ?? 'com.example.ts2jvm';
     const work = mkdtempSync(join(tmpdir(), 'ts2jvm-apk-'));
     const classes = join(work, 'classes');
-    const activityPath = `${pkg.replaceAll('.', '/')}/MainActivity`;
+    const pkgPath = pkg.replaceAll('.', '/');
+    const activityPath = `${pkgPath}/MainActivity`;
 
-    // 1. TypeScript -> Main.class (+ one class per TS class), plus the Activity stub.
-    const files = writeClassFiles(compileFileToClasses(opts.tsFile, 'Main'), classes);
-    files.push(...writeClassFiles([{ name: activityPath, bytes: buildActivity(activityPath) }], classes));
+    // 1. TypeScript -> Main.class (+ one class per TS class). If the TS doesn't declare MainActivity,
+    //    generate an Activity that calls main().
+    const compiled = compileFileToClasses(opts.tsFile, { package: pkg });
+    if (!compiled.some((c) => c.name === activityPath)) {
+        if (!compiled.find((c) => c.name === `${pkgPath}/Main`)) throw new Error('no classes were generated');
+        compiled.push({ name: activityPath, bytes: buildActivity(activityPath, `${pkgPath}/Main`) });
+    }
+    const files = writeClassFiles(compiled, classes);
 
     // 2. D8: class files -> classes.dex.
     const dex = join(work, 'dex');
