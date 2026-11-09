@@ -1,4 +1,4 @@
-import type { HirExpr, HirFunction, HirProgram, HirStmt, ValueType } from '../frontend/hir.ts';
+import type { HirClass, HirExpr, HirFunction, HirProgram, HirStmt, ValueType } from '../frontend/hir.ts';
 import {
     D_BOOLEAN,
     D_DOUBLE,
@@ -9,6 +9,7 @@ import {
     type CompareOp,
     type Desc,
     type DoubleOp,
+    type LirClass,
     type LirExpr,
     type LirFunction,
     type LirProgram,
@@ -53,18 +54,48 @@ const COMPARE_OPS: Partial<Record<string, CompareOp>> = {
 
 export function lowerHirToLir(program: HirProgram, opts: LirOptions): LirProgram {
     const fns = new Map(program.functions.map((f) => [f.name, f]));
-    const lowerer = new Lowerer(opts.className, fns);
-    return { className: opts.className, functions: program.functions.map((f) => lowerer.lowerFunction(f)) };
+    const classes = new Map(program.classes.map((c) => [c.name, c]));
+    const lowerer = new Lowerer(opts.className, fns, classes);
+    return {
+        className: opts.className,
+        functions: program.functions.map((f) => lowerer.lowerFunction(f)),
+        classes: program.classes.map((c) => lowerer.lowerClass(c)),
+    };
 }
 
 class Lowerer {
     private readonly className: string;
     private readonly fns: Map<string, HirFunction>;
+    private readonly classes: Map<string, HirClass>;
     private returnType: ValueType = { kind: 'void' };
 
-    constructor(className: string, fns: Map<string, HirFunction>) {
+    constructor(className: string, fns: Map<string, HirFunction>, classes: Map<string, HirClass>) {
         this.className = className;
         this.fns = fns;
+        this.classes = classes;
+    }
+
+    lowerClass(c: HirClass): LirClass {
+        const ctor = this.lowerFunction(c.ctor);
+        const superCall: LirStmt = {
+            k: 'expr',
+            expr: {
+                k: 'invoke',
+                kind: 'special',
+                owner: 'java/lang/Object',
+                name: '<init>',
+                descriptor: '()V',
+                object: { k: 'load', slot: 0, desc: `L${c.name};` },
+                args: [],
+                desc: D_VOID,
+            },
+        };
+        return {
+            name: c.name,
+            fields: c.fields.map((f) => ({ name: f.name, desc: descOf(f.type) })),
+            ctor: { ...ctor, body: { k: 'block', stmts: [superCall, ctor.body] } },
+            methods: c.methods.map((m) => this.lowerFunction(m)),
+        };
     }
 
     lowerFunction(fn: HirFunction): LirFunction {
@@ -93,6 +124,7 @@ class Lowerer {
                 const e = this.expr(s.expr);
                 // `x = v;` as a statement doesn't need the value left on the stack.
                 if (e.k === 'store') return { k: 'store', slot: e.slot, desc: e.desc, value: e.value };
+                if (e.k === 'putfield') return { ...e };
                 return { k: 'expr', expr: e };
             }
             case 'if':
@@ -172,7 +204,56 @@ class Lowerer {
                 };
             case 'call':
                 return this.call(e);
+            case 'this':
+                return { k: 'load', slot: 0, desc: descOf(e.type) };
+            case 'new': {
+                const ctor = this.classOf(e.className).ctor;
+                return {
+                    k: 'new',
+                    cls: e.className,
+                    descriptor: functionDescriptor(ctor),
+                    args: e.args.map((a, i) => this.coerce(this.expr(a), ctor.params[i]!.type)),
+                    desc: descOf(e.resultType),
+                };
+            }
+            case 'field':
+                return {
+                    k: 'getfield',
+                    owner: e.owner,
+                    name: e.name,
+                    object: this.expr(e.object),
+                    desc: descOf(e.type),
+                };
+            case 'set-field':
+                return {
+                    k: 'putfield',
+                    owner: e.owner,
+                    name: e.name,
+                    object: this.expr(e.object),
+                    value: this.coerce(this.expr(e.rhs), e.type),
+                    desc: descOf(e.type),
+                };
+            case 'call-method': {
+                const method = this.classOf(e.owner).methods.find((m) => m.name === e.name);
+                if (!method) throw new Error(`call to unknown method '${e.owner}.${e.name}'`);
+                return {
+                    k: 'invoke',
+                    kind: 'virtual',
+                    owner: e.owner,
+                    name: e.name,
+                    descriptor: functionDescriptor(method),
+                    object: this.expr(e.object),
+                    args: e.args.map((a, i) => this.coerce(this.expr(a), method.params[i]!.type)),
+                    desc: descOf(e.resultType),
+                };
+            }
         }
+    }
+
+    private classOf(name: string): HirClass {
+        const c = this.classes.get(name);
+        if (!c) throw new Error(`unknown class '${name}'`);
+        return c;
     }
 
     private binary(e: Extract<HirExpr, { k: 'binary' }>): LirExpr {

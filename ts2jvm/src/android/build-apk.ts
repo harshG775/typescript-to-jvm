@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { Acc, ClassWriter } from '../classfile/index.ts';
-import { compileFileToClass } from '../compile.ts';
+import { compileFileToClasses, writeClassFiles } from '../compile.ts';
 import { d8, findAndroidSdk, run } from './sdk.ts';
 
 export interface ApkOptions {
@@ -74,11 +74,9 @@ export function buildApk(opts: ApkOptions): void {
     const classes = join(work, 'classes');
     const activityPath = `${pkg.replaceAll('.', '/')}/MainActivity`;
 
-    // 1. TypeScript -> Main.class, plus the Activity stub.
-    const files = [join(classes, 'Main.class'), join(classes, `${activityPath}.class`)];
-    mkdirSync(dirname(files[1]!), { recursive: true });
-    writeFileSync(files[0]!, compileFileToClass(opts.tsFile, 'Main'));
-    writeFileSync(files[1]!, buildActivity(activityPath));
+    // 1. TypeScript -> Main.class (+ one class per TS class), plus the Activity stub.
+    const files = writeClassFiles(compileFileToClasses(opts.tsFile, 'Main'), classes);
+    files.push(...writeClassFiles([{ name: activityPath, bytes: buildActivity(activityPath) }], classes));
 
     // 2. D8: class files -> classes.dex.
     const dex = join(work, 'dex');

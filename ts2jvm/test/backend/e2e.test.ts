@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vite-plus/test';
-import { compileSourceToClass } from '../../src/compile.ts';
+import { compileSourceToClasses, writeClassFiles } from '../../src/compile.ts';
 
 /**
  * Compiles TypeScript to Main.class, then runs a small Java driver against it with the real JVM
@@ -11,7 +11,7 @@ import { compileSourceToClass } from '../../src/compile.ts';
  */
 function run(tsSource: string, javaMainBody: string): string[] {
     const dir = mkdtempSync(join(tmpdir(), 'ts2jvm-e2e-'));
-    writeFileSync(join(dir, 'Main.class'), compileSourceToClass(tsSource, { fileName: 'test.ts' }));
+    writeClassFiles(compileSourceToClasses(tsSource, { fileName: 'test.ts' }), dir);
     writeFileSync(
         join(dir, 'Driver.java'),
         `public class Driver { public static void main(String[] args) throws Exception { ${javaMainBody} } }`,
@@ -138,7 +138,58 @@ describe('TypeScript -> JVM end to end', () => {
 
     it('rejects a function that can fall off the end without returning', () => {
         expect(() =>
-            compileSourceToClass('function f(x: number): number { if (x > 0) return 1; }', { fileName: 't.ts' }),
+            compileSourceToClasses('function f(x: number): number { if (x > 0) return 1; }', { fileName: 't.ts' }),
         ).toThrow(/without returning/);
+    });
+});
+
+describe('TypeScript classes on the JVM', () => {
+    it('fields, constructors, methods, this, new and field assignment', () => {
+        const ts = `
+            class Counter {
+                count: number = 10;
+                label: string = "n";
+                constructor(start: number) { this.count = this.count + start; }
+                inc(): number { this.count = this.count + 1; return this.count; }
+                describe(): string { return this.label + ":" + this.count; }
+                twice(): number { this.inc(); return this.inc(); }
+            }
+            class Point {
+                x: number;
+                y: number;
+                constructor(x: number, y: number) { this.x = x; this.y = y; }
+                dist2(o: Point): number {
+                    const dx = this.x - o.x;
+                    const dy = this.y - o.y;
+                    return dx * dx + dy * dy;
+                }
+            }
+            class Wrapper { inner: Counter = new Counter(1); }
+            function make(n: number): Counter { return new Counter(n); }
+            function run(): string { const c = make(5); c.inc(); c.inc(); return c.describe(); }
+            function dist(): number { return new Point(0, 0).dist2(new Point(3, 4)); }
+            function chain(): number { const w = new Wrapper(); w.inner.count = 100; w.inner.inc(); return w.inner.count; }
+            function asAny(): any { return new Counter(0); }
+            function assignValue(): number { const c = new Counter(0); let n = 0; n = c.count = 7; return n + c.count; }
+            function twiceViaNew(): number { return make(0).twice(); }
+            function later(): number { return new Late().v; }
+            class Late { v: number = 42; }
+        `;
+        const java = `
+            System.out.println(Main.run());
+            System.out.println(Main.dist());
+            System.out.println(Main.chain());
+            System.out.println(Main.asAny() instanceof Counter);
+            System.out.println(Main.assignValue());
+            System.out.println(Main.twiceViaNew());
+            System.out.println(Main.later());
+            Counter c = new Counter(1.5);
+            System.out.println(c.count + " " + c.label + " " + c.describe());
+        `;
+        expect(run(ts, java)).toEqual(['n:17', '25.0', '101.0', 'true', '14.0', '12.0', '42.0', '11.5 n n:11.5']);
+    });
+
+    it('rejects a class that collides with the top-level functions class', () => {
+        expect(() => compileSourceToClasses('class Main {}', { fileName: 't.ts' })).toThrow(/collides/);
     });
 });

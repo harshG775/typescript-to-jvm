@@ -1,6 +1,16 @@
 import * as ts from 'typescript';
 import { errorAtNode, FrontendError } from './errors.ts';
-import type { HirBinaryOp, HirExpr, HirFunction, HirLocal, HirParam, HirProgram, HirStmt, ValueType } from './hir.ts';
+import type {
+    HirBinaryOp,
+    HirClass,
+    HirExpr,
+    HirFunction,
+    HirLocal,
+    HirParam,
+    HirProgram,
+    HirStmt,
+    ValueType,
+} from './hir.ts';
 import type { ForeignClassInfo, ForeignMethod } from './type-registry.ts';
 
 export interface CompileOptions {
@@ -25,12 +35,22 @@ interface FunctionSig {
     returnType: ValueType;
 }
 
+interface ClassSig {
+    fields: Map<string, ValueType>;
+    ctorParams: ValueType[];
+    methods: Map<string, FunctionSig>;
+}
+
+type Callable = ts.FunctionDeclaration | ts.MethodDeclaration;
+
 /** Per-function lowering state. */
 interface FnCtx {
     scopes: Map<string, VarInfo>[];
     nextSlot: number;
     locals: HirLocal[];
     returnType: ValueType;
+    /** Name of the enclosing class inside methods and constructors, else null. */
+    thisClass: string | null;
 }
 
 export function compileSourceToHir(sourceText: string, opts: CompileOptions): HirProgram {
@@ -119,7 +139,13 @@ function typeOf(e: HirExpr): ValueType {
         case 'unary':
         case 'call':
         case 'cond':
+        case 'new':
+        case 'call-method':
             return e.resultType;
+        case 'this':
+        case 'field':
+        case 'set-field':
+            return e.type;
     }
 }
 
@@ -131,6 +157,7 @@ class Lowerer {
     private readonly checker: ts.TypeChecker;
     private readonly registry: Map<string, ForeignClassInfo>;
     private readonly functions = new Map<string, FunctionSig>();
+    private readonly classes = new Map<string, ClassSig>();
     private fn!: FnCtx;
 
     constructor(checker: ts.TypeChecker, opts: CompileOptions) {
@@ -141,28 +168,49 @@ class Lowerer {
     // ---- top level ---------------------------------------------------------
 
     lowerFile(sf: ts.SourceFile): HirProgram {
-        const decls: ts.FunctionDeclaration[] = [];
+        const fnDecls: ts.FunctionDeclaration[] = [];
+        const classDecls: ts.ClassDeclaration[] = [];
+        // Pass 1: names, so signatures can mention classes declared later in the file.
         for (const stmt of sf.statements) {
-            if (!ts.isFunctionDeclaration(stmt)) errorAtNode(stmt, 'unsupported top-level statement');
-            this.validateFunction(stmt);
-            const name = stmt.name!.text;
-            if (this.functions.has(name)) errorAtNode(stmt.name!, `duplicate function '${name}'`);
-            this.functions.set(name, this.signatureOf(stmt));
-            decls.push(stmt);
+            if (ts.isFunctionDeclaration(stmt)) {
+                fnDecls.push(stmt);
+            } else if (ts.isClassDeclaration(stmt)) {
+                const name = this.classNameOf(stmt);
+                this.classes.set(name, { fields: new Map(), ctorParams: [], methods: new Map() });
+                classDecls.push(stmt);
+            } else {
+                errorAtNode(stmt, 'unsupported top-level statement');
+            }
         }
-        return { functions: decls.map((d) => this.lowerFunction(d)) };
+        // Pass 2: signatures.
+        for (const decl of fnDecls) {
+            this.validateCallable(decl);
+            const name = decl.name!.text;
+            if (this.functions.has(name)) errorAtNode(decl.name!, `duplicate function '${name}'`);
+            this.functions.set(name, this.signatureOf(decl));
+        }
+        for (const decl of classDecls) this.declareClass(decl);
+
+        return {
+            functions: fnDecls.map((d) => this.lowerCallable(d, d.name!.text, this.functions.get(d.name!.text)!, null)),
+            classes: classDecls.map((d) => this.lowerClass(d)),
+        };
     }
 
-    private validateFunction(node: ts.FunctionDeclaration): void {
-        if (!node.name) errorAtNode(node, 'anonymous functions are not supported');
-        for (const m of node.modifiers ?? []) {
-            if (m.kind === ts.SyntaxKind.AsyncKeyword) errorAtNode(node, 'async functions are not supported in v1');
-            errorAtNode(m, `unsupported modifier '${m.getText()}'`);
-        }
-        if (node.asteriskToken) errorAtNode(node, 'generator functions are not supported in v1');
-        if (node.typeParameters?.length) errorAtNode(node, 'generic functions are not supported in v1');
-        if (!node.body) errorAtNode(node, 'function must have a body');
-        for (const p of node.parameters) {
+    private classNameOf(node: ts.ClassDeclaration): string {
+        if (!node.name) errorAtNode(node, 'anonymous classes are not supported');
+        const name = node.name.text;
+        if (this.classes.has(name)) errorAtNode(node.name, `duplicate class '${name}'`);
+        for (const m of node.modifiers ?? []) errorAtNode(m, `unsupported modifier '${m.getText()}'`);
+        if (node.heritageClauses?.length)
+            errorAtNode(node.heritageClauses[0]!, 'class inheritance is not supported yet');
+        if (node.typeParameters?.length) errorAtNode(node, 'generic classes are not supported in v1');
+        return name;
+    }
+
+    private validateParams(params: ts.NodeArray<ts.ParameterDeclaration>): void {
+        for (const p of params) {
+            if (p.modifiers?.length) errorAtNode(p, 'parameter properties are not supported');
             if (!ts.isIdentifier(p.name) || p.questionToken || p.dotDotDotToken || p.initializer) {
                 errorAtNode(
                     p,
@@ -172,7 +220,21 @@ class Lowerer {
         }
     }
 
-    private signatureOf(node: ts.FunctionDeclaration): FunctionSig {
+    private validateCallable(node: Callable): void {
+        if (!node.name) errorAtNode(node, 'anonymous functions are not supported');
+        if (!ts.isIdentifier(node.name))
+            errorAtNode(node.name, 'only plain identifiers can name functions and methods');
+        for (const m of node.modifiers ?? []) {
+            if (m.kind === ts.SyntaxKind.AsyncKeyword) errorAtNode(node, 'async functions are not supported in v1');
+            errorAtNode(m, `unsupported modifier '${m.getText()}'`);
+        }
+        if (node.asteriskToken) errorAtNode(node, 'generator functions are not supported in v1');
+        if (node.typeParameters?.length) errorAtNode(node, 'generic functions are not supported in v1');
+        if (!node.body) errorAtNode(node, 'function must have a body');
+        this.validateParams(node.parameters);
+    }
+
+    private signatureOf(node: Callable): FunctionSig {
         const params = node.parameters.map((p) => this.mapType(this.checker.getTypeAtLocation(p), p));
         const sig = this.checker.getSignatureFromDeclaration(node);
         if (!sig) errorAtNode(node, 'cannot resolve function signature');
@@ -180,10 +242,106 @@ class Lowerer {
         return { params, returnType };
     }
 
-    private lowerFunction(node: ts.FunctionDeclaration): HirFunction {
+    private declareClass(node: ts.ClassDeclaration): void {
+        const sig = this.classes.get(node.name!.text)!;
+        let sawCtor = false;
+        for (const member of node.members) {
+            if (ts.isPropertyDeclaration(member)) {
+                for (const m of member.modifiers ?? []) errorAtNode(m, `unsupported modifier '${m.getText()}'`);
+                if (!ts.isIdentifier(member.name)) errorAtNode(member.name, 'only plain identifiers can name fields');
+                if (member.questionToken || member.exclamationToken)
+                    errorAtNode(member, 'optional fields are not supported');
+                if (!member.type && !member.initializer)
+                    errorAtNode(member, 'field needs a type annotation or an initializer');
+                const fname = member.name.text;
+                if (sig.fields.has(fname) || sig.methods.has(fname))
+                    errorAtNode(member.name, `duplicate member '${fname}'`);
+                sig.fields.set(fname, this.mapType(this.checker.getTypeAtLocation(member.name), member.name));
+            } else if (ts.isMethodDeclaration(member)) {
+                this.validateCallable(member);
+                const mname = (member.name as ts.Identifier).text;
+                if (sig.fields.has(mname) || sig.methods.has(mname))
+                    errorAtNode(member.name, `duplicate member '${mname}'`);
+                sig.methods.set(mname, this.signatureOf(member));
+            } else if (ts.isConstructorDeclaration(member)) {
+                if (sawCtor) errorAtNode(member, 'a class can have only one constructor');
+                sawCtor = true;
+                for (const m of member.modifiers ?? []) errorAtNode(m, `unsupported modifier '${m.getText()}'`);
+                if (!member.body) errorAtNode(member, 'constructor must have a body');
+                this.validateParams(member.parameters);
+                sig.ctorParams = member.parameters.map((p) => this.mapType(this.checker.getTypeAtLocation(p), p));
+            } else {
+                errorAtNode(member, `unsupported class member (${ts.SyntaxKind[member.kind]})`);
+            }
+        }
+    }
+
+    private lowerClass(node: ts.ClassDeclaration): HirClass {
         const name = node.name!.text;
-        const sig = this.functions.get(name)!;
-        this.fn = { scopes: [new Map()], nextSlot: 0, locals: [], returnType: sig.returnType };
+        const sig = this.classes.get(name)!;
+        const methods: HirFunction[] = [];
+        let ctorNode: ts.ConstructorDeclaration | undefined;
+        for (const member of node.members) {
+            if (ts.isMethodDeclaration(member)) {
+                const mname = (member.name as ts.Identifier).text;
+                methods.push(this.lowerCallable(member, mname, sig.methods.get(mname)!, name));
+            } else if (ts.isConstructorDeclaration(member)) {
+                ctorNode = member;
+            }
+        }
+        const fields = [...sig.fields].map(([fname, type]) => ({ name: fname, type }));
+        return { name, fields, ctor: this.lowerConstructor(node, ctorNode, sig), methods };
+    }
+
+    /** Field initializers run first, then the constructor body. They can't see the constructor's parameters. */
+    private lowerConstructor(
+        cls: ts.ClassDeclaration,
+        node: ts.ConstructorDeclaration | undefined,
+        sig: ClassSig,
+    ): HirFunction {
+        const name = cls.name!.text;
+        const self: ValueType = { kind: 'object', className: name };
+        this.fn = { scopes: [new Map()], nextSlot: 1, locals: [], returnType: VOID, thisClass: name };
+
+        const inits: HirStmt[] = [];
+        for (const m of cls.members) {
+            if (!ts.isPropertyDeclaration(m) || !m.initializer) continue;
+            const fname = (m.name as ts.Identifier).text;
+            const type = sig.fields.get(fname)!;
+            const rhs = this.lowerExpr(m.initializer);
+            if (!assignable(typeOf(rhs), type)) {
+                errorAtNode(m.initializer, `cannot assign ${describe(typeOf(rhs))} to ${describe(type)}`);
+            }
+            inits.push({
+                k: 'expr',
+                expr: { k: 'set-field', object: { k: 'this', type: self }, owner: name, name: fname, type, rhs },
+            });
+        }
+
+        const params: HirParam[] = (node?.parameters ?? []).map((p, i) => {
+            const pname = (p.name as ts.Identifier).text;
+            const type = sig.ctorParams[i]!;
+            return { name: pname, type, slot: this.declareSlot(pname, type, p.name) };
+        });
+        const body: HirStmt = node ? this.lowerStmt(node.body!) : { k: 'block', stmts: [] };
+        return {
+            name: '<init>',
+            params,
+            returnType: VOID,
+            locals: this.fn.locals,
+            body: { k: 'block', stmts: [...inits, body] },
+        };
+    }
+
+    /** Lowers a function or method. In a method, slot 0 is `this` and parameters start at slot 1. */
+    private lowerCallable(node: Callable, name: string, sig: FunctionSig, thisClass: string | null): HirFunction {
+        this.fn = {
+            scopes: [new Map()],
+            nextSlot: thisClass ? 1 : 0,
+            locals: [],
+            returnType: sig.returnType,
+            thisClass,
+        };
 
         const params: HirParam[] = node.parameters.map((p, i) => {
             const pname = (p.name as ts.Identifier).text;
@@ -205,6 +363,10 @@ class Lowerer {
         if (f & (ts.TypeFlags.Void | ts.TypeFlags.Undefined)) return position === 'return' ? VOID : NULL;
         if (f & ts.TypeFlags.Null) return NULL;
         if (f & (ts.TypeFlags.Any | ts.TypeFlags.Unknown | ts.TypeFlags.Union)) return OBJECT;
+        const decl = type.symbol?.valueDeclaration;
+        if (decl && ts.isClassDeclaration(decl) && decl.name && this.classes.has(decl.name.text)) {
+            return { kind: 'object', className: decl.name.text };
+        }
         return errorAtNode(node, `unsupported type '${this.checker.typeToString(type)}'`);
     }
 
@@ -354,12 +516,52 @@ class Lowerer {
         if (ts.isPrefixUnaryExpression(node)) return this.lowerPrefixUnary(node);
         if (ts.isConditionalExpression(node)) return this.lowerConditional(node);
         if (ts.isCallExpression(node)) return this.lowerCall(node);
+        if (node.kind === ts.SyntaxKind.ThisKeyword) return this.lowerThis(node);
+        if (ts.isNewExpression(node)) return this.lowerNew(node);
+        if (ts.isPropertyAccessExpression(node)) return this.lowerFieldAccess(node);
         if (ts.isArrowFunction(node) || ts.isFunctionExpression(node)) {
             return errorAtNode(node, 'closures are not supported in v1');
         }
         if (ts.isAwaitExpression(node))
             return errorAtNode(node, 'await is not supported (async is not supported in v1)');
         return errorAtNode(node, `unsupported expression (${ts.SyntaxKind[node.kind]})`);
+    }
+
+    private lowerThis(node: ts.Expression): HirExpr {
+        const cls = this.fn.thisClass;
+        if (!cls) return errorAtNode(node, "'this' is only available inside class methods");
+        return { k: 'this', type: { kind: 'object', className: cls } };
+    }
+
+    /** The user class an expression's value is an instance of, or an error. */
+    private classOf(object: HirExpr, node: ts.Node): { name: string; sig: ClassSig } {
+        const t = typeOf(object);
+        const sig = t.kind === 'object' ? this.classes.get(t.className) : undefined;
+        if (t.kind !== 'object' || !sig) return errorAtNode(node, `'${describe(t)}' has no fields or methods`);
+        return { name: t.className, sig };
+    }
+
+    private lowerFieldAccess(node: ts.PropertyAccessExpression): Extract<HirExpr, { k: 'field' }> {
+        if (node.questionDotToken) errorAtNode(node, 'optional chaining is not supported');
+        if (!ts.isIdentifier(node.name)) errorAtNode(node.name, 'private names are not supported');
+        const object = this.lowerExpr(node.expression);
+        const { name: owner, sig } = this.classOf(object, node.expression);
+        const type = sig.fields.get(node.name.text);
+        if (!type) {
+            const hint = sig.methods.has(node.name.text) ? ' (methods can only be called)' : '';
+            errorAtNode(node.name, `'${owner}' has no field '${node.name.text}'${hint}`);
+        }
+        return { k: 'field', object, owner, name: node.name.text, type };
+    }
+
+    private lowerNew(node: ts.NewExpression): HirExpr {
+        if (node.typeArguments?.length) errorAtNode(node, 'type arguments are not supported');
+        if (!ts.isIdentifier(node.expression)) return errorAtNode(node.expression, 'unsupported new target');
+        const name = node.expression.text;
+        const sig = this.classes.get(name);
+        if (!sig) return errorAtNode(node.expression, `unknown class '${name}'`);
+        const args = this.lowerArgs(node.arguments ?? [], node, `new ${name}`, sig.ctorParams);
+        return { k: 'new', className: name, args, resultType: { kind: 'object', className: name } };
     }
 
     private lowerIdentifier(node: ts.Identifier): HirExpr {
@@ -444,7 +646,22 @@ class Lowerer {
     }
 
     private lowerAssign(node: ts.BinaryExpression): HirExpr {
-        if (!ts.isIdentifier(node.left)) return errorAtNode(node.left, 'can only assign to a local variable');
+        if (ts.isPropertyAccessExpression(node.left)) {
+            const target = this.lowerFieldAccess(node.left);
+            const rhs = this.lowerExpr(node.right);
+            if (!assignable(typeOf(rhs), target.type)) {
+                errorAtNode(node.right, `cannot assign ${describe(typeOf(rhs))} to ${describe(target.type)}`);
+            }
+            return {
+                k: 'set-field',
+                object: target.object,
+                owner: target.owner,
+                name: target.name,
+                type: target.type,
+                rhs,
+            };
+        }
+        if (!ts.isIdentifier(node.left)) return errorAtNode(node.left, 'can only assign to a variable or a field');
         const v = this.lookup(node.left.text);
         if (!v) return errorAtNode(node.left, `unknown identifier '${node.left.text}'`);
         const rhs = this.lowerExpr(node.right);
@@ -460,12 +677,12 @@ class Lowerer {
         const callee = node.expression;
 
         if (ts.isIdentifier(callee)) return this.lowerLocalCall(node, callee);
-        if (
-            ts.isPropertyAccessExpression(callee) &&
-            ts.isIdentifier(callee.expression) &&
-            ts.isIdentifier(callee.name)
-        ) {
-            return this.lowerForeignCall(node, callee.expression, callee.name);
+        if (ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.name)) {
+            const target = callee.expression;
+            if (ts.isIdentifier(target) && !this.lookup(target.text) && this.registry.has(target.text)) {
+                return this.lowerForeignCall(node, target, callee.name);
+            }
+            return this.lowerMethodCall(node, callee, callee.name);
         }
         return errorAtNode(node, 'unsupported call target');
     }
@@ -475,20 +692,43 @@ class Lowerer {
         if (this.lookup(name)) errorAtNode(callee, `'${name}' is a variable, not a function`);
         const sig = this.functions.get(name);
         if (!sig) return errorAtNode(callee, `unknown function '${name}'`);
-        if (node.arguments.length !== sig.params.length) {
-            errorAtNode(node, `'${name}' expects ${sig.params.length} arguments, got ${node.arguments.length}`);
+        const args = this.lowerArgs(node.arguments, node, name, sig.params);
+        return { k: 'call', calleeName: name, args, resultType: sig.returnType };
+    }
+
+    private lowerMethodCall(
+        node: ts.CallExpression,
+        callee: ts.PropertyAccessExpression,
+        method: ts.Identifier,
+    ): HirExpr {
+        const object = this.lowerExpr(callee.expression);
+        const { name: owner, sig } = this.classOf(object, callee.expression);
+        const msig = sig.methods.get(method.text);
+        if (!msig) return errorAtNode(method, `'${owner}' has no method '${method.text}'`);
+        const args = this.lowerArgs(node.arguments, node, `${owner}.${method.text}`, msig.params);
+        return { k: 'call-method', object, owner, name: method.text, args, resultType: msig.returnType };
+    }
+
+    /** Checks the argument count and that each argument can be passed as its parameter type. */
+    private lowerArgs(
+        argNodes: readonly ts.Expression[],
+        node: ts.Node,
+        label: string,
+        params: ValueType[],
+    ): HirExpr[] {
+        if (argNodes.length !== params.length) {
+            errorAtNode(node, `'${label}' expects ${params.length} arguments, got ${argNodes.length}`);
         }
-        const args = node.arguments.map((a, i) => {
+        return argNodes.map((a, i) => {
             const arg = this.lowerExpr(a);
-            if (!assignable(typeOf(arg), sig.params[i]!)) {
+            if (!assignable(typeOf(arg), params[i]!)) {
                 errorAtNode(
                     a,
-                    `argument ${i + 1} of '${name}': cannot pass ${describe(typeOf(arg))} as ${describe(sig.params[i]!)}`,
+                    `argument ${i + 1} of '${label}': cannot pass ${describe(typeOf(arg))} as ${describe(params[i]!)}`,
                 );
             }
             return arg;
         });
-        return { k: 'call', calleeName: name, args, resultType: sig.returnType };
     }
 
     private lowerForeignCall(node: ts.CallExpression, obj: ts.Identifier, method: ts.Identifier): HirExpr {

@@ -17,9 +17,19 @@ export const D_OBJECT: Desc = 'Ljava/lang/Object;';
 export const D_RUNTIME_EXCEPTION: Desc = 'Ljava/lang/RuntimeException;';
 
 export interface LirProgram {
-    /** JVM internal name of the class that holds every function as a static method. */
+    /** JVM internal name of the class that holds every top-level function as a static method. */
     className: string;
     functions: LirFunction[];
+    classes: LirClass[];
+}
+
+export interface LirClass {
+    name: string;
+    fields: { name: string; desc: Desc }[];
+    /** Name `<init>`. Slot 0 is `this`; the body already starts with the super constructor call. */
+    ctor: LirFunction;
+    /** Instance methods: slot 0 is `this`. */
+    methods: LirFunction[];
 }
 
 export interface LirVar {
@@ -43,6 +53,7 @@ export type CompareOp = '<' | '<=' | '>' | '>=' | '==' | '!=';
 export type LirStmt =
     | { k: 'block'; stmts: LirStmt[] }
     | { k: 'store'; slot: number; desc: Desc; value: LirExpr }
+    | { k: 'putfield'; owner: string; name: string; desc: Desc; object: LirExpr; value: LirExpr }
     | { k: 'expr'; expr: LirExpr } // value (if any) is popped
     | { k: 'if'; cond: LirExpr; then: LirStmt; else_: LirStmt | null }
     | { k: 'while'; cond: LirExpr; body: LirStmt }
@@ -82,5 +93,20 @@ export type LirExpr =
     /** Double -> java/lang/Double or boolean -> java/lang/Boolean, typed as Object. */
     | { k: 'box'; operand: LirExpr; desc: Desc }
     | { k: 'checkcast'; cls: string; operand: LirExpr; desc: Desc }
+    | { k: 'new'; cls: string; descriptor: string; args: LirExpr[]; desc: Desc }
+    | { k: 'getfield'; owner: string; name: string; object: LirExpr; desc: Desc }
+    /** Field assignment used as a value: leaves the stored value on the stack. */
+    | { k: 'putfield'; owner: string; name: string; object: LirExpr; value: LirExpr; desc: Desc }
+    /** Instance call: `virtual` for methods, `special` for constructors and super calls. */
+    | {
+          k: 'invoke';
+          kind: 'virtual' | 'special';
+          owner: string;
+          name: string;
+          descriptor: string;
+          object: LirExpr;
+          args: LirExpr[];
+          desc: Desc;
+      }
     /** `new RuntimeException(message)`. */
     | { k: 'new-exception'; message: LirExpr; desc: Desc };

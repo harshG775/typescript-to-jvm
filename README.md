@@ -36,7 +36,7 @@ pnpm typecheck        # typecheck your app (src/)
 pnpm build            # src/main.ts -> build/classes/Main.class
 pnpm apk              # src/main.ts -> build/app.apk (needs ANDROID_HOME)
 pnpm install:device   # same, then adb install
-pnpm test:compiler    # compiler tests (51)
+pnpm test:compiler    # compiler tests (64)
 pnpm lint             # oxlint (config: .oxlintrc.json); lint:fix applies safe fixes
 pnpm format           # oxfmt (config: .oxfmtrc.json); format:check only verifies
 pnpm check            # lint + format:check + both typechecks
@@ -94,14 +94,18 @@ The CLI is a `.ts` file run directly by Node. That works here because the worksp
 - [x] D8 on compiler output (`ts2jvm/src/android/sdk.ts`)
 - [x] Signed debug APK without Gradle: `pnpm apk` (D8, aapt2, zipalign, apksigner; test in `ts2jvm/test/android/`)
 - [x] Activity stub generated with our own `ClassWriter`; its `onCreate` calls the TS `main()`
-- [ ] Run the APK on a device or emulator (none connected when this was built)
+- [x] Run the APK on a device: `Log.d` from TS shows in logcat (`adb logcat -s ts2jvm`) and the Activity renders
 - [ ] Gradle task (only if the script approach stops being enough)
 - [ ] `.d.ts` and registry generated from `android.jar`
 - [ ] `Activity` written in TS (needs classes, Phase 6)
 
 ### Phase 6: Language growth
 
-- [ ] `int`, arrays, classes and interfaces, `for`/`switch`
+- [x] User classes: fields (with initializers), constructor, methods, `this`, `new`, field access/assignment, method calls; one `.class` per TS class
+- [ ] Classes that `extends` a foreign class (`Activity`), `super` calls, overriding
+- [ ] Calling instance methods and `new` on foreign (Android) classes, with subtype-aware assignability
+- [ ] `int`: foreign `int` params/returns convert from/to `number` (d2i / i2d) instead of adding a TS-level int type
+- [ ] Arrays, interfaces, user-class inheritance, `for`/`switch`
 - [ ] Generics, closures, async
 
 ### Phase 7: Tooling

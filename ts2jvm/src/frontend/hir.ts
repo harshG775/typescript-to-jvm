@@ -10,6 +10,24 @@ export type ValueType =
 
 export interface HirProgram {
     functions: HirFunction[];
+    classes: HirClass[];
+}
+
+export interface HirField {
+    name: string;
+    type: ValueType;
+}
+
+/**
+ * A user class. Methods and the constructor are HirFunctions whose slot 0 is `this` (params start at 1).
+ * The constructor's body already starts with the field initializers; it is synthesized when the source has none.
+ */
+export interface HirClass {
+    /** JVM internal name, also the TS name. */
+    name: string;
+    fields: HirField[];
+    ctor: HirFunction;
+    methods: HirFunction[];
 }
 
 export interface HirParam {
@@ -72,4 +90,9 @@ export type HirExpr =
           resultType: ValueType;
           foreign?: { owner: string; method: ForeignMethod };
       }
-    | { k: 'cond'; cond: HirExpr; then: HirExpr; else_: HirExpr; resultType: ValueType };
+    | { k: 'cond'; cond: HirExpr; then: HirExpr; else_: HirExpr; resultType: ValueType }
+    | { k: 'this'; type: ValueType }
+    | { k: 'new'; className: string; args: HirExpr[]; resultType: ValueType }
+    | { k: 'field'; object: HirExpr; owner: string; name: string; type: ValueType }
+    | { k: 'set-field'; object: HirExpr; owner: string; name: string; type: ValueType; rhs: HirExpr }
+    | { k: 'call-method'; object: HirExpr; owner: string; name: string; args: HirExpr[]; resultType: ValueType };

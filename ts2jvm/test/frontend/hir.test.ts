@@ -223,3 +223,89 @@ describe('HIR front end: extra checks', () => {
         expect(() => compile('function f( {')).toThrow(FrontendError);
     });
 });
+
+describe('HIR front end: classes', () => {
+    const COUNTER =
+        'class Counter { count: number = 1; constructor(start: number) { this.count = start; } inc(by: number): number { return this.count + by; } }';
+
+    it('lowers a class: fields, constructor with initializers first, methods with this in slot 0', () => {
+        const { classes } = compile(COUNTER);
+        expect(classes).toHaveLength(1);
+        const [c] = classes;
+        expect(c!.name).toBe('Counter');
+        expect(c!.fields).toEqual([{ name: 'count', type: F64 }]);
+
+        expect(c!.ctor.name).toBe('<init>');
+        expect(c!.ctor.params).toEqual([{ name: 'start', type: F64, slot: 1 }]);
+        expect(c!.ctor.body).toMatchObject({
+            k: 'block',
+            stmts: [
+                { k: 'expr', expr: { k: 'set-field', name: 'count', rhs: { k: 'num', value: 1 } } },
+                {
+                    k: 'block',
+                    stmts: [{ k: 'expr', expr: { k: 'set-field', name: 'count', rhs: { k: 'local', slot: 1 } } }],
+                },
+            ],
+        });
+
+        const inc = c!.methods[0]!;
+        expect(inc.params).toEqual([{ name: 'by', type: F64, slot: 1 }]);
+        expect(stmts(inc)).toMatchObject([
+            {
+                k: 'return',
+                expr: { k: 'binary', left: { k: 'field', object: { k: 'this' }, owner: 'Counter', name: 'count' } },
+            },
+        ]);
+    });
+
+    it('synthesizes a constructor when the class has none', () => {
+        const { classes } = compile('class A { x: number = 2; }');
+        expect(classes[0]!.ctor.params).toEqual([]);
+        expect(classes[0]!.ctor.body).toMatchObject({ k: 'block', stmts: [{ k: 'expr' }, { k: 'block', stmts: [] }] });
+    });
+
+    it('lowers new, field access, field assignment and method calls', () => {
+        const fn = compile(
+            `${COUNTER} function f(): number { const c = new Counter(1); c.count = 5; return c.inc(2); }`,
+        ).functions[0]!;
+        expect(fn.locals).toEqual([{ name: 'c', type: { kind: 'object', className: 'Counter' }, slot: 0 }]);
+        expect(stmts(fn)).toMatchObject([
+            { k: 'var-decl', init: { k: 'new', className: 'Counter', args: [{ k: 'num', value: 1 }] } },
+            { k: 'expr', expr: { k: 'set-field', owner: 'Counter', name: 'count' } },
+            { k: 'return', expr: { k: 'call-method', owner: 'Counter', name: 'inc', resultType: F64 } },
+        ]);
+    });
+
+    it('allows a class to be used before it is declared', () => {
+        expect(() => compile('function f(): number { return new A().x; } class A { x: number = 1; }')).not.toThrow();
+    });
+
+    it('widens a class instance to any', () => {
+        const fn = compile('class A {} function f(a: A): any { return a; }').functions[0]!;
+        expect(fn.returnType).toEqual(OBJECT);
+    });
+
+    it('rejects unsupported class features with a source position', () => {
+        expect(() => compile('class A extends B {}')).toThrow(/inheritance/);
+        expect(() => compile('class A { private x: number = 0; }')).toThrow(/modifier/);
+        expect(() => compile('class A { static x: number = 0; }')).toThrow(/modifier/);
+        expect(() => compile('class A { constructor(public x: number) {} }')).toThrow(/parameter properties/);
+        expect(() => compile('class A { get x(): number { return 1; } }')).toThrow(/unsupported class member/);
+        expect(() => compile('class A { x: number = 0; x: number = 1; }')).toThrow(/duplicate member/);
+        expect(() => compile('class A {} class A {}')).toThrow(/duplicate class/);
+        expect(() => compile('class A {}\nfunction f(): void { new B(); }')).toThrow(/test\.ts:2:.*unknown class/);
+    });
+
+    it('checks field access, method calls and constructor arguments', () => {
+        const A = 'class A { x: number = 0; m(): void {} constructor(n: number) {} }';
+        expect(() => compile(`${A} function f(a: A): number { return a.nope; }`)).toThrow(/no field 'nope'/);
+        expect(() => compile(`${A} function f(a: A): void { a.nope(); }`)).toThrow(/no method 'nope'/);
+        expect(() => compile(`${A} function f(a: A): void { a.x(); }`)).toThrow(/no method 'x'/);
+        expect(() => compile(`${A} function f(a: A): void { a.m; }`)).toThrow(/methods can only be called/);
+        expect(() => compile(`${A} function f(): void { new A(); }`)).toThrow(/expects 1 arguments/);
+        expect(() => compile(`${A} function f(): void { new A("s"); }`)).toThrow(/cannot pass string as f64/);
+        expect(() => compile(`${A} function f(a: A): void { a.x = "s"; }`)).toThrow(/cannot assign string to f64/);
+        expect(() => compile('function f(x: number): number { return x.y; }')).toThrow(/no fields or methods/);
+        expect(() => compile('function f(): void { this.x = 1; }')).toThrow(/'this'/);
+    });
+});

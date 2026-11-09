@@ -1,10 +1,8 @@
 #!/usr/bin/env node
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { buildApk } from './android/build-apk.ts';
 import { run } from './android/sdk.ts';
-import { compileFileToClass } from './compile.ts';
+import { compileFileToClasses, writeClassFiles } from './compile.ts';
 import { compileFileToHir } from './frontend/compile-file.ts';
 import { FrontendError } from './frontend/errors.ts';
 import { createDefaultRegistry } from './frontend/type-registry.ts';
@@ -33,11 +31,11 @@ function main(argv: string[]): void {
 
     switch (command) {
         case 'compile': {
-            const className = values.class ?? 'Main';
-            const out = join(values.out ?? 'build/classes', `${className}.class`);
-            mkdirSync(dirname(out), { recursive: true });
-            writeFileSync(out, compileFileToClass(file, className));
-            console.log(`wrote ${out}`);
+            const paths = writeClassFiles(
+                compileFileToClasses(file, values.class ?? 'Main'),
+                values.out ?? 'build/classes',
+            );
+            for (const p of paths) console.log(`wrote ${p}`);
             return;
         }
         case 'show': {

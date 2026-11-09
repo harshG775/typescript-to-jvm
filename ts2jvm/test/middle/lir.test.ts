@@ -192,3 +192,87 @@ describe('HIR -> LIR', () => {
         ]);
     });
 });
+
+describe('HIR -> LIR: classes', () => {
+    const COUNTER =
+        'class Counter { count: number = 0; label: string = "c"; inc(by: number): number { this.count = this.count + by; return this.count; } }';
+
+    it('lowers a class with fields, a constructor that calls super first, and instance methods', () => {
+        const { classes } = lower(COUNTER);
+        const c = classes[0]!;
+        expect(c.name).toBe('Counter');
+        expect(c.fields).toEqual([
+            { name: 'count', desc: 'D' },
+            { name: 'label', desc: STRING },
+        ]);
+
+        expect(c.ctor.name).toBe('<init>');
+        expect(c.ctor.descriptor).toBe('()V');
+        const body = c.ctor.body;
+        expect(body).toMatchObject({
+            k: 'block',
+            stmts: [
+                {
+                    k: 'expr',
+                    expr: {
+                        k: 'invoke',
+                        kind: 'special',
+                        owner: 'java/lang/Object',
+                        name: '<init>',
+                        descriptor: '()V',
+                    },
+                },
+                {
+                    k: 'block',
+                    stmts: [{ k: 'putfield', name: 'count' }, { k: 'putfield', name: 'label' }, { k: 'block' }],
+                },
+            ],
+        });
+
+        const inc = c.methods[0]!;
+        expect(inc.descriptor).toBe('(D)D');
+        expect(inc.params).toEqual([{ name: 'by', desc: 'D', slot: 1 }]);
+    });
+
+    it('turns field assignment statements into putfield and keeps assignment values', () => {
+        const { classes } = lower(`${COUNTER} function f(c: Counter): number { c.count = 1; return c.count = 2; }`);
+        expect(classes).toHaveLength(1);
+        const fn = lower(`${COUNTER} function f(c: Counter): number { c.count = 1; return c.count = 2; }`)
+            .functions[0]!;
+        expect(stmts(fn)).toMatchObject([
+            {
+                k: 'putfield',
+                owner: 'Counter',
+                name: 'count',
+                desc: 'D',
+                object: { k: 'load', slot: 0, desc: 'LCounter;' },
+            },
+            { k: 'return', value: { k: 'putfield', owner: 'Counter', name: 'count', desc: 'D' } },
+        ]);
+    });
+
+    it('lowers new and method calls with descriptors, boxing arguments to Object', () => {
+        const src = `class A { constructor(x: any) {} m(y: any): void {} }
+            function f(): void { const a = new A(1); a.m("s"); }`;
+        const fn = lower(src).functions[0]!;
+        expect(stmts(fn)).toMatchObject([
+            { k: 'store', value: { k: 'new', cls: 'A', descriptor: `(${OBJECT})V`, args: [{ k: 'box' }] } },
+            {
+                k: 'expr',
+                expr: {
+                    k: 'invoke',
+                    kind: 'virtual',
+                    owner: 'A',
+                    name: 'm',
+                    descriptor: `(${OBJECT})V`,
+                    args: [{ k: 'sconst' }],
+                },
+            },
+        ]);
+    });
+
+    it('does not box a class instance widened to Object', () => {
+        const fn = lower('class A {} function f(a: A): any { return a; }').functions[0]!;
+        expect(stmts(fn)).toMatchObject([{ k: 'return', value: { k: 'load', desc: 'LA;' } }]);
+    });
+});

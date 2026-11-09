@@ -14,17 +14,44 @@ export interface CodegenOptions {
     sourceFile?: string;
 }
 
-/** Turns a LIR program into the bytes of one `.class` file holding every function as a public static method. */
-export function generateClass(program: LirProgram, opts: CodegenOptions = {}): Uint8Array {
-    const cw = new ClassWriter(program.className, opts.sourceFile === undefined ? {} : { sourceFile: opts.sourceFile });
+export interface ClassFile {
+    /** JVM internal name, e.g. `Main`. */
+    name: string;
+    bytes: Uint8Array;
+}
+
+/**
+ * Turns a LIR program into class files: one holding every top-level function as a public static method
+ * (named `program.className`), plus one per user class.
+ */
+export function generateClasses(program: LirProgram, opts: CodegenOptions = {}): ClassFile[] {
+    if (program.classes.some((c) => c.name === program.className)) {
+        throw new Error(
+            `a class named '${program.className}' collides with the generated class for top-level functions`,
+        );
+    }
     const usage = { numToString: false };
+    const sourceFile = opts.sourceFile === undefined ? {} : { sourceFile: opts.sourceFile };
+
+    const files: ClassFile[] = program.classes.map((c) => {
+        const cw = new ClassWriter(c.name, sourceFile);
+        for (const f of c.fields) cw.addField(Acc.PUBLIC, f.name, f.desc);
+        for (const fn of [c.ctor, ...c.methods]) {
+            cw.addMethod(Acc.PUBLIC, fn.name, fn.descriptor, (code) =>
+                new FunctionGen(code, fn, program.className, usage).run(),
+            );
+        }
+        return { name: c.name, bytes: cw.toBytes() };
+    });
+
+    const cw = new ClassWriter(program.className, sourceFile);
     for (const fn of program.functions) {
         cw.addMethod(Acc.PUBLIC | Acc.STATIC, fn.name, fn.descriptor, (c) =>
             new FunctionGen(c, fn, program.className, usage).run(),
         );
     }
     if (usage.numToString) addNumToString(cw);
-    return cw.toBytes();
+    return [{ name: program.className, bytes: cw.toBytes() }, ...files];
 }
 
 function kindOf(desc: string): Kind {
@@ -40,7 +67,7 @@ const NUM_TO_STRING = '$ts2jvm$num';
  * uses Java's formatting. Large and tiny magnitudes (1e21, 1e-7) still differ from JS.
  */
 function addNumToString(cw: ClassWriter): void {
-    cw.addMethod(Acc.PRIVATE | Acc.STATIC | Acc.SYNTHETIC, NUM_TO_STRING, '(D)Ljava/lang/String;', (c) => {
+    cw.addMethod(Acc.STATIC | Acc.SYNTHETIC, NUM_TO_STRING, '(D)Ljava/lang/String;', (c) => {
         const other = c.newLabel();
         c.load('d', 0);
         c.load('d', 0);
@@ -138,6 +165,11 @@ class FunctionGen {
                 this.expr(s.value);
                 c.store(kindOf(s.desc), s.slot);
                 return;
+            case 'putfield':
+                this.expr(s.object);
+                this.expr(s.value);
+                c.putfield(s.owner, s.name, s.desc);
+                return;
             case 'expr':
                 this.expr(s.expr);
                 this.discard(s.expr);
@@ -182,7 +214,7 @@ class FunctionGen {
 
     private discard(e: LirExpr): void {
         // A call's real JVM return type decides what is on the stack, not its TS-facing type.
-        const desc = e.k === 'call' ? parseMethodDescriptor(e.descriptor).returns : e.desc;
+        const desc = e.k === 'call' || e.k === 'invoke' ? parseMethodDescriptor(e.descriptor).returns : e.desc;
         const n = slotSize(desc);
         if (n === 2) this.c.op('pop2');
         else if (n === 1) this.c.op('pop');
@@ -431,6 +463,29 @@ class FunctionGen {
                 this.expr(e.operand);
                 if (e.operand.desc === 'D') c.invokestatic('java/lang/Double', 'valueOf', '(D)Ljava/lang/Double;');
                 else c.invokestatic('java/lang/Boolean', 'valueOf', '(Z)Ljava/lang/Boolean;');
+                return;
+            case 'new':
+                c.newObject(e.cls);
+                c.op('dup');
+                for (const a of e.args) this.expr(a);
+                c.invokespecial(e.cls, '<init>', e.descriptor);
+                return;
+            case 'getfield':
+                this.expr(e.object);
+                c.getfield(e.owner, e.name, e.desc);
+                return;
+            case 'putfield':
+                this.expr(e.object);
+                this.expr(e.value);
+                // Copy the value under the object so one copy is left after the store.
+                c.op(e.desc === 'D' ? 'dup2_x1' : 'dup_x1');
+                c.putfield(e.owner, e.name, e.desc);
+                return;
+            case 'invoke':
+                this.expr(e.object);
+                for (const a of e.args) this.expr(a);
+                if (e.kind === 'special') c.invokespecial(e.owner, e.name, e.descriptor);
+                else c.invokevirtual(e.owner, e.name, e.descriptor);
                 return;
             case 'checkcast':
                 this.expr(e.operand);
