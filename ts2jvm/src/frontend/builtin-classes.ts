@@ -20,6 +20,7 @@ const SPECS: Record<string, Spec> = {
     'java/lang/Object': { ctors: ['()V'] },
     'java/lang/CharSequence': { interface: true, super: 'java/lang/Object', methods: ['length()I'] },
     'java/lang/String': { super: 'java/lang/Object', interfaces: ['java/lang/CharSequence'] },
+    'java/lang/Integer': { super: 'java/lang/Object', methods: [`static parseInt(${STR})I`] },
     'java/lang/Math': {
         super: 'java/lang/Object',
         methods: [

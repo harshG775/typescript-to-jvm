@@ -4,7 +4,19 @@
 // Numbers are `number` everywhere: ts2jvm converts to and from Java int/float/long at each call.
 
 declare module 'android.content' {
-    export class Context {}
+    export interface SharedPreferencesEditor {
+        putString(key: string, value: string): SharedPreferencesEditor;
+        apply(): void;
+    }
+
+    export interface SharedPreferences {
+        getString(key: string, defaultValue: string): string;
+        edit(): SharedPreferencesEditor;
+    }
+
+    export class Context {
+        getSharedPreferences(name: string, mode: number): SharedPreferences;
+    }
 }
 
 declare module 'android.os' {
@@ -20,23 +32,47 @@ declare module 'android.util' {
     }
 }
 
+declare module 'android.graphics' {
+    export class Color {
+        /** Parses '#RRGGBB' or '#AARRGGBB' into an Android color. */
+        static parseColor(colorString: string): number;
+    }
+}
+
 declare module 'android.view' {
     import { Context } from 'android.content';
 
     export class View {
         constructor(context: Context);
         setId(id: number): void;
+        setPadding(left: number, top: number, right: number, bottom: number): void;
+        setBackgroundColor(color: number): void;
+    }
+
+    export class ViewGroup extends View {
+        addView(child: View): void;
     }
 }
 
 declare module 'android.widget' {
     import { Context } from 'android.content';
-    import { View } from 'android.view';
+    import { View, ViewGroup } from 'android.view';
 
     export class TextView extends View {
         constructor(context: Context);
         setText(text: string): void;
         setTextSize(size: number): void;
+        setTextColor(color: number): void;
+    }
+
+    /** Orientation: 0 = horizontal, 1 = vertical. */
+    export class LinearLayout extends ViewGroup {
+        constructor(context: Context);
+        setOrientation(orientation: number): void;
+    }
+
+    export class ScrollView extends ViewGroup {
+        constructor(context: Context);
     }
 }
 

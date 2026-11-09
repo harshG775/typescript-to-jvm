@@ -400,3 +400,15 @@ describe('HIR front end: inheritance and Android classes', () => {
         ).toThrow(/doesn't match the JVM signature/);
     });
 });
+
+describe('HIR front end: inferred types of Java results', () => {
+    it('keeps a number a number when the checker can only say any', () => {
+        const src = `import { Integer } from 'java.lang';
+            function f(s: string): string { const n = Integer.parseInt(s) + 1; const t = n; return 'x' + n + t; }`;
+        const fn = compile(src).functions[0]!;
+        expect(fn.locals).toEqual([
+            { name: 'n', type: F64, slot: 1 },
+            { name: 't', type: F64, slot: 3 },
+        ]);
+    });
+});

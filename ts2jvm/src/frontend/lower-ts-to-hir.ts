@@ -751,10 +751,11 @@ class Lowerer {
         let type =
             (decl.type && this.typeFromNode(decl.type)) ||
             this.mapType(this.checker.getTypeAtLocation(decl.name), decl.name);
-        // The checker can't see imported Java classes (`new TextView(...)` is `any` to it), but the initializer knows.
+        // The checker can't see imported Java classes: `new TextView(...)` and `Integer.parseInt(s) + 1` are `any`
+        // to it, but the initializer's own type is known.
         if (!decl.type && init && typesEqual(type, OBJECT)) {
             const t = typeOf(init);
-            if (t.kind === 'object') type = t;
+            if (t.kind !== 'void' && t.kind !== 'null') type = t;
         }
         if (init && !this.assignable(typeOf(init), type)) {
             errorAtNode(decl.initializer!, `cannot assign ${describe(typeOf(init))} to ${describe(type)}`);
