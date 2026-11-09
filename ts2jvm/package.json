@@ -1,0 +1,28 @@
+{
+    "name": "ts2jvm",
+    "version": "0.0.0",
+    "private": true,
+    "description": "Compiles a static subset of TypeScript to JVM bytecode for Android",
+    "bin": {
+        "ts2jvm": "./src/cli.ts"
+    },
+    "type": "module",
+    "types": "./types/index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./types/index.d.ts",
+            "default": "./src/index.ts"
+        }
+    },
+    "scripts": {
+        "typecheck": "tsc --noEmit",
+        "test": "vp test"
+    },
+    "dependencies": {
+        "typescript": "5.9.3"
+    },
+    "devDependencies": {
+        "@types/node": "^26.6.6",
+        "vite-plus": "^1.5.0"
+    }
+}

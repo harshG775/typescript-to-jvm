@@ -1,15 +1,24 @@
 {
-  "name": "typescript-to-jvm",
-  "version": "0.0.0",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "typecheck": "tsc --noEmit",
-    "test": "vp test"
-  },
-  "devDependencies": {
-    "@types/node": "^26.6.6",
-    "typescript": "5.9.3",
-    "vite-plus": "^1.5.0"
-  }
+    "name": "my-android-app",
+    "version": "0.0.0",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "typecheck": "tsc --noEmit",
+        "build": "ts2jvm compile",
+        "apk": "ts2jvm apk",
+        "install:device": "ts2jvm apk --install",
+        "lint": "oxlint",
+        "lint:fix": "oxlint --fix",
+        "format": "oxfmt",
+        "format:check": "oxfmt --check",
+        "test:compiler": "pnpm --filter ts2jvm test",
+        "check": "pnpm lint && pnpm format:check && pnpm typecheck && pnpm --filter ts2jvm typecheck"
+    },
+    "devDependencies": {
+        "oxfmt": "^0.77.0",
+        "oxlint": "^1.92.0",
+        "ts2jvm": "workspace:*",
+        "typescript": "5.9.3"
+    }
 }

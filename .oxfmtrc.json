@@ -1,0 +1,7 @@
+{
+    "$schema": "./node_modules/oxfmt/configuration_schema.json",
+    "printWidth": 120,
+    "tabWidth": 4,
+    "singleQuote": true,
+    "ignorePatterns": ["pnpm-lock.yaml", "ts2jvm/test/**/fixtures/**", "ts2jvm/examples/**"]
+}

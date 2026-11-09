@@ -1,0 +1,22 @@
+{
+    "$schema": "./node_modules/oxlint/configuration_schema.json",
+    "plugins": ["typescript", "unicorn", "oxc"],
+    "categories": {
+        "correctness": "error"
+    },
+    "rules": {
+        // The IR uses `then` as a field name (if/cond nodes); none of these objects are promises.
+        "unicorn/no-thenable": "off"
+    },
+    "overrides": [
+        {
+            // Entry points like main() are called by the generated Activity, not from TypeScript.
+            "files": ["src/**"],
+            "rules": { "no-unused-vars": "off" }
+        }
+    ],
+    "env": {
+        "builtin": true
+    },
+    "ignorePatterns": ["build", "ts2jvm/test/**/fixtures/**", "ts2jvm/examples/**"]
+}
